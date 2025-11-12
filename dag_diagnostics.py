@@ -208,6 +208,148 @@ class DiagnosticQueries:
         ORDER BY hash_variations DESC, update_frequency DESC
         """
 
+    @staticmethod
+    def get_traffic_pattern_hourly_query(analysis_days: int) -> str:
+        """Query to analyze hourly traffic patterns"""
+        return f"""
+        WITH hourly_stats AS (
+            SELECT 
+                EXTRACT(HOUR FROM execution_date) as hour_of_day,
+                EXTRACT(DOW FROM execution_date) as day_of_week,
+                COUNT(*) as dag_runs,
+                COUNT(DISTINCT dag_id) as unique_dags,
+                AVG(CASE 
+                    WHEN end_date IS NOT NULL AND start_date IS NOT NULL 
+                    THEN EXTRACT(EPOCH FROM (end_date - start_date))
+                    ELSE NULL 
+                END) as avg_duration_seconds
+            FROM dag_run
+            WHERE execution_date >= CURRENT_DATE - INTERVAL '{analysis_days} days'
+            GROUP BY hour_of_day, day_of_week
+        )
+        SELECT 
+            hour_of_day,
+            SUM(dag_runs) as total_runs,
+            AVG(dag_runs) as avg_runs_per_day,
+            MAX(dag_runs) as max_runs_in_hour,
+            AVG(unique_dags) as avg_unique_dags,
+            AVG(avg_duration_seconds) as avg_duration_seconds
+        FROM hourly_stats
+        GROUP BY hour_of_day
+        ORDER BY hour_of_day
+        """
+
+    @staticmethod
+    def get_traffic_pattern_concurrent_query(analysis_days: int) -> str:
+        """Query to analyze concurrent DAG run patterns"""
+        return f"""
+        WITH time_points AS (
+            SELECT DISTINCT 
+                start_date as time_point
+            FROM dag_run
+            WHERE start_date >= CURRENT_DATE - INTERVAL '{analysis_days} days'
+            UNION
+            SELECT DISTINCT 
+                end_date as time_point
+            FROM dag_run
+            WHERE end_date >= CURRENT_DATE - INTERVAL '{analysis_days} days'
+                AND end_date IS NOT NULL
+        ),
+        concurrent_runs AS (
+            SELECT 
+                tp.time_point,
+                COUNT(dr.dag_id) as concurrent_dags
+            FROM time_points tp
+            LEFT JOIN dag_run dr ON 
+                dr.start_date <= tp.time_point 
+                AND (dr.end_date >= tp.time_point OR dr.end_date IS NULL)
+                AND dr.start_date >= CURRENT_DATE - INTERVAL '{analysis_days} days'
+            GROUP BY tp.time_point
+        )
+        SELECT 
+            MAX(concurrent_dags) as max_concurrent_dags,
+            AVG(concurrent_dags) as avg_concurrent_dags,
+            PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY concurrent_dags) as p95_concurrent_dags,
+            PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY concurrent_dags) as p99_concurrent_dags
+        FROM concurrent_runs
+        WHERE concurrent_dags > 0
+        """
+
+    @staticmethod
+    def get_traffic_pattern_dag_frequency_query(analysis_days: int) -> str:
+        """Query to analyze DAG execution frequency patterns"""
+        return f"""
+        WITH dag_schedule_stats AS (
+            SELECT 
+                dag_id,
+                COUNT(*) as total_runs,
+                COUNT(DISTINCT DATE(execution_date)) as active_days,
+                MIN(execution_date) as first_run,
+                MAX(execution_date) as last_run,
+                AVG(EXTRACT(EPOCH FROM (end_date - start_date))) as avg_duration_seconds,
+                STDDEV(EXTRACT(EPOCH FROM (end_date - start_date))) as stddev_duration_seconds
+            FROM dag_run
+            WHERE execution_date >= CURRENT_DATE - INTERVAL '{analysis_days} days'
+                AND end_date IS NOT NULL
+                AND start_date IS NOT NULL
+            GROUP BY dag_id
+        )
+        SELECT 
+            dag_id,
+            total_runs,
+            active_days,
+            ROUND(total_runs::numeric / NULLIF(active_days, 0), 2) as avg_runs_per_day,
+            ROUND(avg_duration_seconds, 2) as avg_duration_seconds,
+            ROUND(stddev_duration_seconds, 2) as stddev_duration_seconds,
+            CASE 
+                WHEN stddev_duration_seconds > avg_duration_seconds * 0.5 THEN 'High Variance'
+                WHEN stddev_duration_seconds > avg_duration_seconds * 0.3 THEN 'Medium Variance'
+                ELSE 'Low Variance'
+            END as duration_variance,
+            EXTRACT(EPOCH FROM (last_run - first_run)) / 3600 as time_span_hours
+        FROM dag_schedule_stats
+        WHERE total_runs > 1
+        ORDER BY total_runs DESC
+        """
+
+    @staticmethod
+    def get_traffic_pattern_task_concurrency_query(analysis_days: int) -> str:
+        """Query to analyze task-level concurrency patterns"""
+        return f"""
+        WITH task_time_points AS (
+            SELECT DISTINCT 
+                start_date as time_point
+            FROM task_instance
+            WHERE start_date >= CURRENT_DATE - INTERVAL '{analysis_days} days'
+            UNION
+            SELECT DISTINCT 
+                end_date as time_point
+            FROM task_instance
+            WHERE end_date >= CURRENT_DATE - INTERVAL '{analysis_days} days'
+                AND end_date IS NOT NULL
+        ),
+        concurrent_tasks AS (
+            SELECT 
+                tp.time_point,
+                COUNT(ti.task_id) as concurrent_tasks
+            FROM task_time_points tp
+            LEFT JOIN task_instance ti ON 
+                ti.start_date <= tp.time_point 
+                AND (ti.end_date >= tp.time_point OR ti.end_date IS NULL)
+                AND ti.start_date >= CURRENT_DATE - INTERVAL '{analysis_days} days'
+                AND ti.state IN ('running', 'queued')
+            GROUP BY tp.time_point
+        )
+        SELECT 
+            MAX(concurrent_tasks) as max_concurrent_tasks,
+            AVG(concurrent_tasks) as avg_concurrent_tasks,
+            PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY concurrent_tasks) as p95_concurrent_tasks,
+            PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY concurrent_tasks) as p99_concurrent_tasks,
+            COUNT(*) as sample_points
+        FROM concurrent_tasks
+        WHERE concurrent_tasks > 0
+        """
+
 
 # =============================================================================
 # CONFIGURATION ANALYSIS HELPERS
@@ -318,77 +460,365 @@ def analyze_config_setting(
 
 
 def analyze_configuration_issues(config_analysis: Dict[str, Any]) -> List[str]:
-    """Analyze configuration for potential stability issues"""
+    """Analyze configuration for potential stability issues and conflicts"""
     issues = []
 
     try:
-        # Check core settings
+        # Extract configuration sections
         core_config = config_analysis.get("core", {})
-
-        # Check if serialized DAGs are enabled
-        if core_config.get("store_serialized_dags", {}).get("value") not in [
-            "True",
-            "true",
-            "1",
-        ]:
-            issues.append("Serialized DAGs not enabled - may impact performance")
-
-        # Check parallelism settings
-        parallelism = core_config.get("parallelism", {}).get("value", "32")
-        max_active_tasks = core_config.get("max_active_tasks_per_dag", {}).get(
-            "value", "16"
-        )
-        try:
-            if int(parallelism) < int(max_active_tasks):
-                issues.append(
-                    f"Global parallelism ({parallelism}) < max_active_tasks_per_dag ({max_active_tasks})"
-                )
-        except (ValueError, TypeError):
-            pass
-
-        # Check scheduler settings
         scheduler_config = config_analysis.get("scheduler", {})
-
-        # Check DAG parsing processes
-        parsing_processes = scheduler_config.get("parsing_processes", {}).get(
-            "value", "2"
-        )
-        try:
-            if int(parsing_processes) < 2:
-                issues.append("Low number of DAG parsing processes - may cause delays")
-        except (ValueError, TypeError):
-            pass
-
-        # Check Celery settings
         celery_config = config_analysis.get("celery", {})
-
-        # Check worker concurrency
-        worker_concurrency = celery_config.get("worker_concurrency", {}).get(
-            "value", "16"
-        )
-        try:
-            if int(worker_concurrency) > int(parallelism):
-                issues.append(
-                    f"Celery worker_concurrency ({worker_concurrency}) > core parallelism ({parallelism})"
-                )
-        except (ValueError, TypeError):
-            pass
-
-        # Check database settings
         db_config = config_analysis.get("database", {})
 
-        # Check connection pool size
-        pool_size = db_config.get("sql_alchemy_pool_size", {}).get("value", "5")
+        # =================================================================
+        # CRITICAL: DAG Processing Timeout Conflicts
+        # =================================================================
+        
+        # Issue: dagbag_import_timeout must be LESS than dag_file_processor_timeout
+        # The file processor timeout is the overall timeout for processing a DAG file,
+        # while dagbag_import_timeout is for importing the DAG itself
         try:
-            if int(pool_size) < 10:
+            dag_file_processor_timeout = int(core_config.get("dag_file_processor_timeout", {}).get("value", "50"))
+            dagbag_import_timeout = int(core_config.get("dagbag_import_timeout", {}).get("value", "30"))
+            
+            if dagbag_import_timeout >= dag_file_processor_timeout:
                 issues.append(
-                    "Small database connection pool - may cause connection issues under load"
+                    f"🚨 CRITICAL: dagbag_import_timeout ({dagbag_import_timeout}s) >= "
+                    f"dag_file_processor_timeout ({dag_file_processor_timeout}s). "
+                    f"DAG imports will timeout before file processing completes. "
+                    f"Recommendation: dagbag_import_timeout should be 20-30% less than dag_file_processor_timeout"
                 )
-        except (ValueError, TypeError):
+            elif dagbag_import_timeout > (dag_file_processor_timeout * 0.8):
+                issues.append(
+                    f"⚠️ WARNING: dagbag_import_timeout ({dagbag_import_timeout}s) is too close to "
+                    f"dag_file_processor_timeout ({dag_file_processor_timeout}s). "
+                    f"Leave more buffer to prevent timeout race conditions"
+                )
+        except (ValueError, TypeError, KeyError):
+            pass
+
+        # =================================================================
+        # CRITICAL: Scheduler File Processing Interval Conflicts
+        # =================================================================
+        
+        # Issue: min_file_process_interval should be LESS than dag_dir_list_interval
+        # The scheduler lists the DAG directory at dag_dir_list_interval, but won't
+        # process files more frequently than min_file_process_interval
+        try:
+            dag_dir_list_interval = int(scheduler_config.get("dag_dir_list_interval", {}).get("value", "300"))
+            min_file_process_interval = int(scheduler_config.get("min_file_process_interval", {}).get("value", "30"))
+            
+            if min_file_process_interval > dag_dir_list_interval:
+                issues.append(
+                    f"🚨 CRITICAL: min_file_process_interval ({min_file_process_interval}s) > "
+                    f"dag_dir_list_interval ({dag_dir_list_interval}s). "
+                    f"Scheduler will list DAG directory more frequently than it can process files, "
+                    f"causing resource contention and processing delays. "
+                    f"Recommendation: min_file_process_interval should be less than dag_dir_list_interval"
+                )
+            elif min_file_process_interval == dag_dir_list_interval:
+                issues.append(
+                    f"⚠️ WARNING: min_file_process_interval ({min_file_process_interval}s) equals "
+                    f"dag_dir_list_interval ({dag_dir_list_interval}s). "
+                    f"This may cause timing conflicts. Set min_file_process_interval lower"
+                )
+        except (ValueError, TypeError, KeyError):
+            pass
+
+        # =================================================================
+        # Parallelism and Concurrency Conflicts
+        # =================================================================
+        
+        # Check if serialized DAGs are enabled
+        if core_config.get("store_serialized_dags", {}).get("value") not in ["True", "true", "1"]:
+            issues.append("⚠️ Serialized DAGs not enabled - may impact performance and scheduler stability")
+
+        # Global parallelism vs max_active_tasks_per_dag
+        try:
+            parallelism = int(core_config.get("parallelism", {}).get("value", "32"))
+            max_active_tasks = int(core_config.get("max_active_tasks_per_dag", {}).get("value", "16"))
+            max_active_runs = int(core_config.get("max_active_runs_per_dag", {}).get("value", "16"))
+            
+            if parallelism < max_active_tasks:
+                issues.append(
+                    f"⚠️ Global parallelism ({parallelism}) < max_active_tasks_per_dag ({max_active_tasks}). "
+                    f"DAGs cannot reach their max task concurrency"
+                )
+            
+            # Check if parallelism is too low for the number of potential concurrent tasks
+            potential_concurrent_tasks = max_active_tasks * max_active_runs
+            if parallelism < potential_concurrent_tasks:
+                issues.append(
+                    f"⚠️ Global parallelism ({parallelism}) may be insufficient for "
+                    f"max_active_tasks_per_dag ({max_active_tasks}) × max_active_runs_per_dag ({max_active_runs}) = "
+                    f"{potential_concurrent_tasks} potential concurrent tasks"
+                )
+        except (ValueError, TypeError, KeyError):
+            pass
+
+        # =================================================================
+        # Celery Worker Configuration Conflicts
+        # =================================================================
+        
+        try:
+            worker_concurrency = int(celery_config.get("worker_concurrency", {}).get("value", "16"))
+            parallelism = int(core_config.get("parallelism", {}).get("value", "32"))
+            
+            if worker_concurrency > parallelism:
+                issues.append(
+                    f"⚠️ Celery worker_concurrency ({worker_concurrency}) > core parallelism ({parallelism}). "
+                    f"Workers may accept more tasks than the system can handle"
+                )
+            
+            # Check if worker_concurrency is too high for typical worker resources
+            if worker_concurrency > 32:
+                issues.append(
+                    f"⚠️ Very high worker_concurrency ({worker_concurrency}). "
+                    f"Ensure workers have sufficient CPU/memory resources"
+                )
+        except (ValueError, TypeError, KeyError):
+            pass
+
+        # =================================================================
+        # Database Connection Pool Conflicts
+        # =================================================================
+        
+        try:
+            pool_size = int(db_config.get("sql_alchemy_pool_size", {}).get("value", "5"))
+            max_overflow = int(db_config.get("sql_alchemy_max_overflow", {}).get("value", "10"))
+            parallelism = int(core_config.get("parallelism", {}).get("value", "32"))
+            parsing_processes = int(scheduler_config.get("parsing_processes", {}).get("value", "2"))
+            
+            # Get executor and webserver configuration
+            executor = core_config.get("executor", {}).get("value", "SequentialExecutor")
+            webserver_workers = int(config_analysis.get("webserver", {}).get("workers", {}).get("value", "4"))
+            worker_concurrency = int(celery_config.get("worker_concurrency", {}).get("value", "16"))
+            
+            # Calculate estimated connection requirements
+            # NOTE: Each Airflow process (scheduler, webserver worker, celery worker, etc.) 
+            # maintains its own connection pool of size pool_size + max_overflow
+            
+            # 1. Scheduler components
+            scheduler_connections = parsing_processes  # Each parsing process needs connections
+            scheduler_connections += 1  # Scheduler main loop
+            scheduler_connections += 1  # DagFileProcessorManager
+            
+            # 2. Webserver
+            webserver_connections = webserver_workers  # Each gunicorn worker
+            
+            # 3. Executor-specific
+            executor_connections = 0
+            if "Celery" in executor:
+                # CeleryExecutor: Each worker process needs connections
+                # Estimate: Assume 2-4 worker processes per environment (conservative)
+                estimated_celery_workers = 2  # Conservative estimate
+                executor_connections = estimated_celery_workers
+            elif "Local" in executor:
+                # LocalExecutor: Runs tasks in scheduler process, minimal extra connections
+                executor_connections = 1
+            elif "Kubernetes" in executor:
+                # KubernetesExecutor: Minimal connections (pods connect separately)
+                executor_connections = 1
+            
+            # 4. Triggerer (if async tasks are used)
+            triggerer_connections = 1
+            
+            # 5. Buffer for transient connections
+            buffer_connections = 2
+            
+            # Total estimated connections needed across ALL processes
+            # IMPORTANT: This is total connections to the database, not per-process pool size
+            total_estimated_connections = (
+                scheduler_connections + 
+                webserver_connections + 
+                executor_connections + 
+                triggerer_connections + 
+                buffer_connections
+            )
+            
+            # Per-process pool calculation
+            # Each process has pool_size base + max_overflow burst capacity
+            total_pool_per_process = pool_size + max_overflow
+            
+            # Estimate total possible connections if all processes max out
+            # This is a worst-case scenario
+            num_processes = (
+                1 +  # Scheduler
+                parsing_processes +  # DAG processors
+                webserver_workers +  # Webserver workers
+                executor_connections +  # Executor workers
+                1  # Triggerer
+            )
+            worst_case_connections = num_processes * total_pool_per_process
+            
+            # Generate warnings based on analysis
+            if pool_size < 5:
+                issues.append(
+                    f"⚠️ Very small database connection pool ({pool_size}). "
+                    f"May cause connection exhaustion. Recommended: >= 5"
+                )
+            
+            # Check if pool size is reasonable for the number of processes
+            # Rule of thumb: pool_size should be at least 5-10 per major component
+            recommended_pool_size = max(5, parsing_processes + 3)
+            if pool_size < recommended_pool_size:
+                issues.append(
+                    f"⚠️ Database pool size ({pool_size}) may be small for {parsing_processes} parsing processes. "
+                    f"Each Airflow process maintains its own pool. Recommended: >= {recommended_pool_size}"
+                )
+            
+            # Check total pool capacity per process
+            if total_pool_per_process < 10:
+                issues.append(
+                    f"⚠️ Total pool capacity per process ({pool_size} + {max_overflow} = {total_pool_per_process}) is small. "
+                    f"Under load, processes may exhaust connections. Recommended: total >= 10"
+                )
+            
+            # Warn about worst-case scenario
+            if worst_case_connections > 100:
+                issues.append(
+                    f"⚠️ Worst-case database connections: {worst_case_connections} "
+                    f"({num_processes} processes × {total_pool_per_process} pool). "
+                    f"Verify database max_connections can handle this. "
+                    f"Note: Actual usage is typically much lower."
+                )
+            
+            # Check if pool is too large (can cause database connection limits)
+            if pool_size > 50:
+                issues.append(
+                    f"⚠️ Very large connection pool ({pool_size}) per process. "
+                    f"With {num_processes} processes, worst-case is {worst_case_connections} connections. "
+                    f"Verify database can handle this load."
+                )
+            
+            # Executor-specific warnings
+            if "Celery" in executor and pool_size < 10:
+                issues.append(
+                    f"⚠️ CeleryExecutor with small pool size ({pool_size}). "
+                    f"Each Celery worker maintains its own pool. Consider increasing to >= 10."
+                )
+            
+            # Provide context in a separate info message (not an issue, just FYI)
+            # This helps users understand the calculation
+            connection_breakdown = (
+                f"Database Connection Estimate: "
+                f"Scheduler={scheduler_connections}, "
+                f"Webserver={webserver_connections}, "
+                f"Executor={executor_connections}, "
+                f"Other={triggerer_connections + buffer_connections}. "
+                f"Total estimated: {total_estimated_connections} concurrent connections. "
+                f"Per-process pool: {total_pool_per_process}. "
+                f"Worst-case (all processes maxed): {worst_case_connections}."
+            )
+            # Note: We don't add this as an "issue" but it could be logged or included in detailed output
+            
+        except (ValueError, TypeError, KeyError) as e:
+            # Silently skip if we can't parse the values
+            pass
+
+        # =================================================================
+        # Scheduler Performance Conflicts
+        # =================================================================
+        
+        try:
+            parsing_processes = int(scheduler_config.get("parsing_processes", {}).get("value", "2"))
+            
+            if parsing_processes < 2:
+                issues.append(
+                    f"⚠️ Low number of DAG parsing processes ({parsing_processes}). "
+                    f"May cause DAG processing delays. Recommended: >= 2"
+                )
+            elif parsing_processes > 8:
+                issues.append(
+                    f"⚠️ High number of parsing processes ({parsing_processes}). "
+                    f"May cause CPU contention and database connection pressure"
+                )
+        except (ValueError, TypeError, KeyError):
+            pass
+
+        # Check scheduler loop intervals
+        try:
+            dag_dir_list_interval = int(scheduler_config.get("dag_dir_list_interval", {}).get("value", "300"))
+            
+            if dag_dir_list_interval < 30:
+                issues.append(
+                    f"⚠️ Very frequent DAG directory scanning ({dag_dir_list_interval}s). "
+                    f"May cause excessive I/O and CPU usage"
+                )
+            elif dag_dir_list_interval > 600:
+                issues.append(
+                    f"⚠️ Infrequent DAG directory scanning ({dag_dir_list_interval}s). "
+                    f"New DAGs may take a long time to be detected"
+                )
+        except (ValueError, TypeError, KeyError):
+            pass
+
+        # =================================================================
+        # Task Execution Timeout Conflicts
+        # =================================================================
+        
+        try:
+            killed_task_cleanup_time = int(core_config.get("killed_task_cleanup_time", {}).get("value", "60"))
+            
+            if killed_task_cleanup_time < 30:
+                issues.append(
+                    f"⚠️ Very short killed_task_cleanup_time ({killed_task_cleanup_time}s). "
+                    f"Tasks may be cleaned up before they can gracefully shutdown"
+                )
+            elif killed_task_cleanup_time > 300:
+                issues.append(
+                    f"⚠️ Long killed_task_cleanup_time ({killed_task_cleanup_time}s). "
+                    f"Zombie tasks may consume resources for extended periods"
+                )
+        except (ValueError, TypeError, KeyError):
+            pass
+
+        # =================================================================
+        # Serialization Configuration Conflicts
+        # =================================================================
+        
+        try:
+            min_serialized_dag_update_interval = int(core_config.get("min_serialized_dag_update_interval", {}).get("value", "30"))
+            min_serialized_dag_fetch_interval = int(core_config.get("min_serialized_dag_fetch_interval", {}).get("value", "10"))
+            dag_dir_list_interval = int(scheduler_config.get("dag_dir_list_interval", {}).get("value", "300"))
+            
+            # Update interval should be less than or equal to dir list interval
+            if min_serialized_dag_update_interval > dag_dir_list_interval:
+                issues.append(
+                    f"⚠️ min_serialized_dag_update_interval ({min_serialized_dag_update_interval}s) > "
+                    f"dag_dir_list_interval ({dag_dir_list_interval}s). "
+                    f"Serialized DAGs may not update as frequently as directory is scanned"
+                )
+            
+            # Fetch interval should be less than update interval
+            if min_serialized_dag_fetch_interval >= min_serialized_dag_update_interval:
+                issues.append(
+                    f"⚠️ min_serialized_dag_fetch_interval ({min_serialized_dag_fetch_interval}s) >= "
+                    f"min_serialized_dag_update_interval ({min_serialized_dag_update_interval}s). "
+                    f"Webserver may fetch stale DAG data"
+                )
+        except (ValueError, TypeError, KeyError):
+            pass
+
+        # =================================================================
+        # DagRun Creation Limits
+        # =================================================================
+        
+        try:
+            max_dagruns_to_create = int(scheduler_config.get("max_dagruns_to_create_per_loop", {}).get("value", "10"))
+            max_dagruns_to_schedule = int(scheduler_config.get("max_dagruns_per_loop_to_schedule", {}).get("value", "20"))
+            
+            if max_dagruns_to_create > max_dagruns_to_schedule:
+                issues.append(
+                    f"⚠️ max_dagruns_to_create_per_loop ({max_dagruns_to_create}) > "
+                    f"max_dagruns_per_loop_to_schedule ({max_dagruns_to_schedule}). "
+                    f"Scheduler may create more DagRuns than it can schedule"
+                )
+        except (ValueError, TypeError, KeyError):
             pass
 
     except Exception as e:
-        issues.append(f"Error analyzing configuration: {str(e)}")
+        issues.append(f"❌ Error analyzing configuration: {str(e)}")
 
     return issues
 
@@ -495,6 +925,7 @@ def capture_airflow_configuration(**context):
         ],
         "scheduler": [
             "dag_dir_list_interval",
+            "min_file_process_interval",
             "catchup_by_default",
             "max_dagruns_to_create_per_loop",
             "max_dagruns_per_loop_to_schedule",
@@ -541,15 +972,21 @@ def capture_airflow_configuration(**context):
         "parallelism": "HIGH",
         "max_active_tasks_per_dag": "HIGH",
         "max_active_runs_per_dag": "HIGH",
+        "dagbag_import_timeout": "HIGH",
         "dag_file_processor_timeout": "HIGH",
         "store_serialized_dags": "HIGH",
         "min_serialized_dag_update_interval": "HIGH",
+        "min_serialized_dag_fetch_interval": "HIGH",
         "dag_dir_list_interval": "HIGH",
+        "min_file_process_interval": "HIGH",
         "parsing_processes": "HIGH",
         "worker_concurrency": "HIGH",
         "broker_url": "HIGH",
         "result_backend": "HIGH",
         "sql_alchemy_pool_size": "HIGH",
+        "sql_alchemy_max_overflow": "HIGH",
+        "max_dagruns_to_create_per_loop": "MEDIUM",
+        "max_dagruns_per_loop_to_schedule": "MEDIUM",
     }
 
     # Sensitive settings to mask
@@ -651,12 +1088,34 @@ def capture_airflow_configuration(**context):
     print(f"Previous hash: {previous_hash}")
     print(f"Configuration changed: {'YES' if config_changed else 'NO'}")
 
+    # Analyze configuration for conflicts and issues
+    print(f"\n🔍 CONFIGURATION CONFLICT ANALYSIS")
+    print("-" * 80)
+    
+    # Prepare config analysis structure for the analyzer
+    config_analysis_input = {
+        "core": {setting: {"value": value} for setting, value in config_data.get("core", {}).items()},
+        "scheduler": {setting: {"value": value} for setting, value in config_data.get("scheduler", {}).items()},
+        "celery": {setting: {"value": value} for setting, value in config_data.get("celery", {}).items()},
+        "database": {setting: {"value": value} for setting, value in config_data.get("database", {}).items()},
+    }
+    
+    config_issues = analyze_configuration_issues(config_analysis_input)
+    
+    if config_issues:
+        print(f"Found {len(config_issues)} configuration issues:\n")
+        for issue in config_issues:
+            print(f"  {issue}")
+    else:
+        print("✅ No configuration conflicts detected")
+
     return {
         "timestamp": datetime.now().isoformat(),
         "config_hash": config_hash,
         "previous_hash": previous_hash,
         "config_changed": config_changed,
         "configuration": config_data,
+        "issues": config_issues,
         "total_settings": sum(
             len(section)
             for section in config_data.values()
@@ -1055,6 +1514,279 @@ def analyze_serialization_instability(**context):
     except Exception as e:
         print(f"Could not analyze serialization instability: {e}")
         return {"unstable_dags": 0, "unstable_dag_list": [], "error": str(e)}
+
+
+@task()
+def analyze_traffic_patterns(**context):
+    """Analyze DAG execution traffic patterns to identify scheduling hotspots and resource utilization"""
+    conn_info = context["task_instance"].xcom_pull(
+        task_ids="create_postgres_connection"
+    )
+    conn_id = conn_info["conn_id"]
+
+    postgres_hook = PostgresHook(postgres_conn_id=conn_id)
+
+    print("\n" + "=" * 80)
+    print("TRAFFIC PATTERN ANALYSIS")
+    print("=" * 80)
+
+    traffic_analysis = {
+        "hourly_patterns": {},
+        "concurrent_patterns": {},
+        "dag_frequency": [],
+        "task_concurrency": {},
+        "insights": []
+    }
+
+    # 1. Hourly Traffic Patterns
+    print("\n📊 HOURLY TRAFFIC PATTERNS")
+    print("-" * 40)
+    
+    try:
+        hourly_query = DiagnosticQueries.get_traffic_pattern_hourly_query(ANALYSIS_DAYS)
+        hourly_records = postgres_hook.get_records(hourly_query)
+        
+        if hourly_records:
+            print(f"{'Hour':<6} {'Total Runs':<12} {'Avg/Day':<10} {'Max/Hour':<10} {'Avg Duration':<15}")
+            print("-" * 60)
+            
+            hourly_data = []
+            peak_hour = None
+            peak_runs = 0
+            quiet_hours = []
+            
+            for record in hourly_records:
+                hour = int(record[0])
+                total_runs = int(record[1])
+                avg_runs = float(record[2]) if record[2] else 0
+                max_runs = int(record[3]) if record[3] else 0
+                avg_duration = float(record[5]) if record[5] else 0
+                
+                duration_str = f"{avg_duration/60:.1f}m" if avg_duration < 3600 else f"{avg_duration/3600:.1f}h"
+                
+                print(f"{hour:02d}:00  {total_runs:<12} {avg_runs:<10.1f} {max_runs:<10} {duration_str:<15}")
+                
+                hourly_data.append({
+                    "hour": hour,
+                    "total_runs": total_runs,
+                    "avg_runs_per_day": avg_runs,
+                    "max_runs_in_hour": max_runs,
+                    "avg_duration_seconds": avg_duration
+                })
+                
+                # Track peak hour
+                if total_runs > peak_runs:
+                    peak_runs = total_runs
+                    peak_hour = hour
+                
+                # Track quiet hours (less than 10% of peak)
+                if total_runs < peak_runs * 0.1 and total_runs > 0:
+                    quiet_hours.append(hour)
+            
+            traffic_analysis["hourly_patterns"] = {
+                "data": hourly_data,
+                "peak_hour": peak_hour,
+                "peak_runs": peak_runs,
+                "quiet_hours": quiet_hours
+            }
+            
+            print(f"\n🔥 Peak Hour: {peak_hour:02d}:00 with {peak_runs} total runs")
+            if quiet_hours:
+                quiet_hours_str = ", ".join([f"{h:02d}:00" for h in quiet_hours[:5]])
+                print(f"😴 Quiet Hours: {quiet_hours_str}")
+                if len(quiet_hours) > 5:
+                    print(f"   ... and {len(quiet_hours) - 5} more")
+            
+            # Generate insights
+            if peak_runs > 100:
+                traffic_analysis["insights"].append(
+                    f"⚠️ High traffic during peak hour ({peak_hour:02d}:00) with {peak_runs} runs - consider load balancing"
+                )
+            
+            if len(quiet_hours) > 8:
+                traffic_analysis["insights"].append(
+                    f"💡 {len(quiet_hours)} quiet hours detected - opportunity to shift non-critical workloads"
+                )
+                
+    except Exception as e:
+        print(f"Error analyzing hourly patterns: {e}")
+        traffic_analysis["hourly_patterns"]["error"] = str(e)
+
+    # 2. Concurrent DAG Run Patterns
+    print("\n🔄 CONCURRENT DAG RUN PATTERNS")
+    print("-" * 40)
+    
+    try:
+        concurrent_query = DiagnosticQueries.get_traffic_pattern_concurrent_query(ANALYSIS_DAYS)
+        concurrent_records = postgres_hook.get_records(concurrent_query)
+        
+        if concurrent_records and concurrent_records[0]:
+            record = concurrent_records[0]
+            max_concurrent = int(record[0]) if record[0] else 0
+            avg_concurrent = float(record[1]) if record[1] else 0
+            p95_concurrent = float(record[2]) if record[2] else 0
+            p99_concurrent = float(record[3]) if record[3] else 0
+            
+            print(f"Max Concurrent DAGs: {max_concurrent}")
+            print(f"Avg Concurrent DAGs: {avg_concurrent:.1f}")
+            print(f"P95 Concurrent DAGs: {p95_concurrent:.1f}")
+            print(f"P99 Concurrent DAGs: {p99_concurrent:.1f}")
+            
+            traffic_analysis["concurrent_patterns"] = {
+                "max_concurrent_dags": max_concurrent,
+                "avg_concurrent_dags": avg_concurrent,
+                "p95_concurrent_dags": p95_concurrent,
+                "p99_concurrent_dags": p99_concurrent
+            }
+            
+            # Check against parallelism settings
+            try:
+                parallelism = int(conf.get("core", "parallelism", fallback="32"))
+                max_active_runs = int(conf.get("core", "max_active_runs_per_dag", fallback="16"))
+                
+                if max_concurrent > max_active_runs * 0.8:
+                    traffic_analysis["insights"].append(
+                        f"⚠️ Peak concurrent DAGs ({max_concurrent}) approaching max_active_runs_per_dag ({max_active_runs})"
+                    )
+                
+                if p95_concurrent > max_active_runs * 0.6:
+                    traffic_analysis["insights"].append(
+                        f"💡 P95 concurrent DAGs ({p95_concurrent:.0f}) is high - consider increasing max_active_runs_per_dag"
+                    )
+            except Exception:
+                pass
+                
+    except Exception as e:
+        print(f"Error analyzing concurrent patterns: {e}")
+        traffic_analysis["concurrent_patterns"]["error"] = str(e)
+
+    # 3. DAG Frequency Analysis
+    print("\n📈 DAG EXECUTION FREQUENCY")
+    print("-" * 40)
+    
+    try:
+        frequency_query = DiagnosticQueries.get_traffic_pattern_dag_frequency_query(ANALYSIS_DAYS)
+        frequency_records = postgres_hook.get_records(frequency_query)
+        
+        if frequency_records:
+            print(f"{'DAG ID':<35} {'Total Runs':<12} {'Runs/Day':<10} {'Variance':<15}")
+            print("-" * 75)
+            
+            high_frequency_dags = []
+            variable_duration_dags = []
+            
+            for record in frequency_records[:15]:  # Top 15
+                dag_id = record[0]
+                total_runs = int(record[1])
+                runs_per_day = float(record[3]) if record[3] else 0
+                variance = record[6] if record[6] else "Unknown"
+                
+                print(f"{dag_id:<35} {total_runs:<12} {runs_per_day:<10.1f} {variance:<15}")
+                
+                traffic_analysis["dag_frequency"].append({
+                    "dag_id": dag_id,
+                    "total_runs": total_runs,
+                    "runs_per_day": runs_per_day,
+                    "duration_variance": variance
+                })
+                
+                # Track high frequency DAGs
+                if runs_per_day > 50:
+                    high_frequency_dags.append((dag_id, runs_per_day))
+                
+                # Track variable duration DAGs
+                if variance == "High Variance":
+                    variable_duration_dags.append(dag_id)
+            
+            if high_frequency_dags:
+                print(f"\n🔥 High Frequency DAGs ({len(high_frequency_dags)}):")
+                for dag_id, rpd in high_frequency_dags[:3]:
+                    print(f"   - {dag_id}: {rpd:.1f} runs/day")
+                traffic_analysis["insights"].append(
+                    f"⚠️ {len(high_frequency_dags)} DAGs running >50 times/day - verify scheduling is intentional"
+                )
+            
+            if variable_duration_dags:
+                print(f"\n⚠️ Variable Duration DAGs ({len(variable_duration_dags)}):")
+                for dag_id in variable_duration_dags[:3]:
+                    print(f"   - {dag_id}")
+                traffic_analysis["insights"].append(
+                    f"💡 {len(variable_duration_dags)} DAGs have high duration variance - investigate performance inconsistencies"
+                )
+                
+    except Exception as e:
+        print(f"Error analyzing DAG frequency: {e}")
+        traffic_analysis["dag_frequency"] = {"error": str(e)}
+
+    # 4. Task Concurrency Patterns
+    print("\n⚙️ TASK CONCURRENCY PATTERNS")
+    print("-" * 40)
+    
+    try:
+        task_query = DiagnosticQueries.get_traffic_pattern_task_concurrency_query(ANALYSIS_DAYS)
+        task_records = postgres_hook.get_records(task_query)
+        
+        if task_records and task_records[0]:
+            record = task_records[0]
+            max_concurrent_tasks = int(record[0]) if record[0] else 0
+            avg_concurrent_tasks = float(record[1]) if record[1] else 0
+            p95_concurrent_tasks = float(record[2]) if record[2] else 0
+            p99_concurrent_tasks = float(record[3]) if record[3] else 0
+            
+            print(f"Max Concurrent Tasks: {max_concurrent_tasks}")
+            print(f"Avg Concurrent Tasks: {avg_concurrent_tasks:.1f}")
+            print(f"P95 Concurrent Tasks: {p95_concurrent_tasks:.1f}")
+            print(f"P99 Concurrent Tasks: {p99_concurrent_tasks:.1f}")
+            
+            traffic_analysis["task_concurrency"] = {
+                "max_concurrent_tasks": max_concurrent_tasks,
+                "avg_concurrent_tasks": avg_concurrent_tasks,
+                "p95_concurrent_tasks": p95_concurrent_tasks,
+                "p99_concurrent_tasks": p99_concurrent_tasks
+            }
+            
+            # Check against parallelism
+            try:
+                parallelism = int(conf.get("core", "parallelism", fallback="32"))
+                
+                utilization = (avg_concurrent_tasks / parallelism) * 100
+                peak_utilization = (max_concurrent_tasks / parallelism) * 100
+                
+                print(f"\nParallelism Utilization:")
+                print(f"  Average: {utilization:.1f}%")
+                print(f"  Peak: {peak_utilization:.1f}%")
+                
+                if peak_utilization > 90:
+                    traffic_analysis["insights"].append(
+                        f"🚨 Peak task concurrency ({max_concurrent_tasks}) exceeds 90% of parallelism ({parallelism}) - increase parallelism"
+                    )
+                elif peak_utilization > 75:
+                    traffic_analysis["insights"].append(
+                        f"⚠️ Peak task concurrency ({max_concurrent_tasks}) exceeds 75% of parallelism ({parallelism}) - monitor closely"
+                    )
+                elif utilization < 30:
+                    traffic_analysis["insights"].append(
+                        f"💡 Low average utilization ({utilization:.1f}%) - parallelism ({parallelism}) may be over-provisioned"
+                    )
+            except Exception:
+                pass
+                
+    except Exception as e:
+        print(f"Error analyzing task concurrency: {e}")
+        traffic_analysis["task_concurrency"]["error"] = str(e)
+
+    # Summary
+    print(f"\n📊 TRAFFIC ANALYSIS SUMMARY")
+    print("-" * 40)
+    print(f"Insights Generated: {len(traffic_analysis['insights'])}")
+    if traffic_analysis["insights"]:
+        print("\nKey Insights:")
+        for insight in traffic_analysis["insights"]:
+            print(f"  {insight}")
+    else:
+        print("✅ No significant traffic pattern issues detected")
+
+    return traffic_analysis
 
 
 @task()
@@ -1534,6 +2266,9 @@ def generate_complete_report(**context):
     instability_analysis = context["task_instance"].xcom_pull(
         task_ids="analyze_serialization_instability"
     )
+    traffic_analysis = context["task_instance"].xcom_pull(
+        task_ids="analyze_traffic_patterns"
+    )
     system_metrics = context["task_instance"].xcom_pull(
         task_ids="collect_system_metrics"
     )
@@ -1599,6 +2334,19 @@ def generate_complete_report(**context):
         report_lines.append(f"Current hash: {config_analysis['config_hash']}")
     else:
         report_lines.append("✅ No configuration changes detected since last run")
+    
+    # Configuration conflicts and issues (PROMINENT SECTION)
+    config_issues = config_analysis.get("issues", [])
+    if config_issues:
+        report_lines.append(f"\n🚨 CONFIGURATION CONFLICTS AND ISSUES ({len(config_issues)}):")
+        report_lines.append("-" * 50)
+        for issue in config_issues:
+            # Add indentation for readability
+            report_lines.append(f"{issue}")
+        report_lines.append("")
+    else:
+        report_lines.append("\n✅ No configuration conflicts detected")
+        report_lines.append("")
 
     # Environment information
     try:
@@ -1634,16 +2382,6 @@ def generate_complete_report(**context):
         )
         print(f"DEBUG - Environment info error: {str(e)}")
 
-    # Configuration issues
-    if config_analysis.get("issues"):
-        report_lines.append(
-            f"\n🚨 CONFIGURATION ISSUES ({len(config_analysis['issues'])}):"
-        )
-        for issue in config_analysis["issues"]:
-            report_lines.append(f"  - {issue}")
-    else:
-        report_lines.append("\n✅ No critical configuration issues detected")
-
     # Detailed configuration table
     report_lines.append(f"\nDetailed Configuration Analysis:")
     report_lines.append(f"{'Setting':<40} {'Value':<25} {'Impact':<8} {'Status':<15}")
@@ -1669,6 +2407,7 @@ def generate_complete_report(**context):
             ],
             "scheduler": [
                 "dag_dir_list_interval",
+                "min_file_process_interval",
                 "catchup_by_default",
                 "max_dagruns_to_create_per_loop",
                 "max_dagruns_per_loop_to_schedule",
@@ -1691,6 +2430,12 @@ def generate_complete_report(**context):
                 "worker_refresh_batch_size",
                 "reload_on_plugin_change",
             ],
+            "database": [
+                "sql_alchemy_pool_size",
+                "sql_alchemy_max_overflow",
+                "sql_alchemy_pool_recycle",
+                "sql_alchemy_pool_pre_ping",
+            ],
         }
 
         # Impact levels for display (only for settings included in report)
@@ -1699,11 +2444,16 @@ def generate_complete_report(**context):
             "parallelism": "HIGH",
             "max_active_tasks_per_dag": "HIGH",
             "max_active_runs_per_dag": "HIGH",
+            "dagbag_import_timeout": "HIGH",
             "dag_file_processor_timeout": "HIGH",
             "min_serialized_dag_update_interval": "HIGH",
+            "min_serialized_dag_fetch_interval": "HIGH",
             "dag_dir_list_interval": "HIGH",
+            "min_file_process_interval": "HIGH",
             "parsing_processes": "HIGH",
             "worker_concurrency": "HIGH",
+            "sql_alchemy_pool_size": "HIGH",
+            "sql_alchemy_max_overflow": "MEDIUM",
         }
 
         # No sensitive settings in the filtered report
@@ -1892,6 +2642,68 @@ def generate_complete_report(**context):
             )
     report_lines.append("")
 
+    # Traffic Pattern Analysis Section
+    report_lines.append("📊 TRAFFIC PATTERN ANALYSIS")
+    report_lines.append("-" * 50)
+    
+    try:
+        if traffic_analysis and isinstance(traffic_analysis, dict):
+            # Hourly patterns
+            hourly = traffic_analysis.get("hourly_patterns", {})
+            if hourly and isinstance(hourly, dict) and "peak_hour" in hourly:
+                report_lines.append(f"Peak Hour: {hourly['peak_hour']:02d}:00 ({hourly['peak_runs']} runs)")
+                if hourly.get("quiet_hours"):
+                    quiet_count = len(hourly["quiet_hours"])
+                    report_lines.append(f"Quiet Hours: {quiet_count} hours with minimal activity")
+            
+            # Concurrent patterns
+            concurrent = traffic_analysis.get("concurrent_patterns", {})
+            if concurrent and isinstance(concurrent, dict) and "max_concurrent_dags" in concurrent:
+                report_lines.append(f"\nConcurrency:")
+                report_lines.append(f"  Max Concurrent DAGs: {concurrent['max_concurrent_dags']}")
+                report_lines.append(f"  Avg Concurrent DAGs: {concurrent['avg_concurrent_dags']:.1f}")
+                report_lines.append(f"  P95 Concurrent DAGs: {concurrent['p95_concurrent_dags']:.1f}")
+            
+            # Task concurrency
+            task_conc = traffic_analysis.get("task_concurrency", {})
+            if task_conc and isinstance(task_conc, dict) and "max_concurrent_tasks" in task_conc:
+                report_lines.append(f"\nTask Concurrency:")
+                report_lines.append(f"  Max Concurrent Tasks: {task_conc['max_concurrent_tasks']}")
+                report_lines.append(f"  Avg Concurrent Tasks: {task_conc['avg_concurrent_tasks']:.1f}")
+                report_lines.append(f"  P95 Concurrent Tasks: {task_conc['p95_concurrent_tasks']:.1f}")
+                
+                # Calculate utilization if possible
+                try:
+                    parallelism = int(conf.get("core", "parallelism", fallback="32"))
+                    avg_util = (task_conc['avg_concurrent_tasks'] / parallelism) * 100
+                    peak_util = (task_conc['max_concurrent_tasks'] / parallelism) * 100
+                    report_lines.append(f"  Avg Utilization: {avg_util:.1f}%")
+                    report_lines.append(f"  Peak Utilization: {peak_util:.1f}%")
+                except Exception:
+                    pass
+            
+            # High frequency DAGs
+            dag_freq = traffic_analysis.get("dag_frequency", [])
+            if dag_freq and isinstance(dag_freq, list):
+                high_freq = [d for d in dag_freq if isinstance(d, dict) and d.get("runs_per_day", 0) > 50]
+                if high_freq:
+                    report_lines.append(f"\nHigh Frequency DAGs ({len(high_freq)}):")
+                    for dag in high_freq[:5]:
+                        report_lines.append(f"  - {dag['dag_id']}: {dag['runs_per_day']:.1f} runs/day")
+            
+            # Traffic insights
+            insights = traffic_analysis.get("insights", [])
+            if insights and isinstance(insights, list):
+                report_lines.append(f"\nTraffic Insights:")
+                for insight in insights:
+                    report_lines.append(f"  {insight}")
+        else:
+            report_lines.append("Traffic analysis not available")
+    except Exception as e:
+        report_lines.append(f"Error displaying traffic analysis: {str(e)}")
+    
+    report_lines.append("")
+
     # System Metrics Section
     report_lines.append("🖥️ SYSTEM STATISTICS")
     report_lines.append("-" * 50)
@@ -2048,6 +2860,21 @@ def generate_complete_report(**context):
 
     recommendations = []
 
+    # Prioritize configuration issues
+    config_issues = config_analysis.get("issues", [])
+    critical_config_issues = [issue for issue in config_issues if "🚨 CRITICAL" in issue]
+    warning_config_issues = [issue for issue in config_issues if "⚠️ WARNING" in issue and "🚨 CRITICAL" not in issue]
+    
+    if critical_config_issues:
+        recommendations.append(
+            f"🚨 URGENT: Fix {len(critical_config_issues)} critical configuration conflicts that may cause DAG processing failures"
+        )
+    
+    if warning_config_issues:
+        recommendations.append(
+            f"Review {len(warning_config_issues)} configuration warnings to optimize performance"
+        )
+
     if config_analysis["config_changed"]:
         recommendations.append(
             "Review recent Airflow configuration changes for potential impact"
@@ -2072,6 +2899,36 @@ def generate_complete_report(**context):
         recommendations.append(
             f"Investigate {instability_analysis['unstable_dags']} DAGs with serialization instability"
         )
+
+    # Traffic pattern recommendations
+    if traffic_analysis and isinstance(traffic_analysis, dict):
+        traffic_insights = traffic_analysis.get("insights", [])
+        if isinstance(traffic_insights, list):
+            critical_traffic = [i for i in traffic_insights if "🚨" in i]
+            warning_traffic = [i for i in traffic_insights if "⚠️" in i and "🚨" not in i]
+            
+            if critical_traffic:
+                recommendations.append(
+                    f"Address {len(critical_traffic)} critical traffic/concurrency issues"
+                )
+            
+            if warning_traffic:
+                recommendations.append(
+                    f"Review {len(warning_traffic)} traffic pattern warnings for optimization opportunities"
+                )
+        
+        # Check for specific patterns
+        concurrent = traffic_analysis.get("concurrent_patterns", {})
+        if isinstance(concurrent, dict) and concurrent.get("max_concurrent_dags", 0) > 50:
+            recommendations.append(
+                "High concurrent DAG execution detected - verify scheduler and worker capacity"
+            )
+        
+        task_conc = traffic_analysis.get("task_concurrency", {})
+        if isinstance(task_conc, dict) and task_conc.get("max_concurrent_tasks", 0) > 100:
+            recommendations.append(
+                "High task concurrency detected - ensure adequate parallelism configuration"
+            )
 
     # DAG folder recommendations
     if system_metrics and "dag_folder_info" in system_metrics:
@@ -2127,6 +2984,9 @@ def generate_complete_report(**context):
             "failing_tasks": failure_analysis["total_failing_tasks"],
             "unstable_dags": instability_analysis["unstable_dags"],
             "config_changed": config_analysis["config_changed"],
+            "traffic_insights": len(traffic_analysis.get("insights", [])) if traffic_analysis else 0,
+            "peak_concurrent_dags": traffic_analysis.get("concurrent_patterns", {}).get("max_concurrent_dags", 0) if traffic_analysis else 0,
+            "peak_concurrent_tasks": traffic_analysis.get("task_concurrency", {}).get("max_concurrent_tasks", 0) if traffic_analysis else 0,
             "recommendations_count": len(recommendations),
         },
     }
@@ -2225,12 +3085,14 @@ def cleanup_postgres_connection(**context):
     doc_md="""
     ## DAG Diagnostics
     
-    This DAG provides diagnostics for MWAA environments including:
-    - Airflow configuration change detection
+    This DAG provides comprehensive diagnostics for MWAA environments including:
+    - Airflow configuration change detection and conflict analysis
     - DAG serialization analysis
     - Performance monitoring
     - Failure pattern analysis
     - Serialization instability detection
+    - Traffic pattern and concurrency analysis
+    - System metrics collection
     
     ### Parameters:
     - **analysis_days**: Number of days to analyze (default: 7)
@@ -2262,6 +3124,7 @@ def dag_diagnostics_dag():
     performance_analysis = analyze_dag_performance()
     failure_analysis = analyze_task_failures()
     instability_analysis = analyze_serialization_instability()
+    traffic_analysis = analyze_traffic_patterns()
     system_metrics = collect_system_metrics()
 
     # Generate diagnostics report
@@ -2277,6 +3140,7 @@ def dag_diagnostics_dag():
         performance_analysis,
         failure_analysis,
         instability_analysis,
+        traffic_analysis,
         system_metrics,
     ]
     (
@@ -2286,6 +3150,7 @@ def dag_diagnostics_dag():
             performance_analysis,
             failure_analysis,
             instability_analysis,
+            traffic_analysis,
             system_metrics,
         ]
         >> report
