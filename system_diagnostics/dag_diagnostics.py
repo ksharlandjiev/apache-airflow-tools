@@ -11,10 +11,10 @@ import hashlib
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 from airflow.decorators import dag, task
-from airflow.utils.dates import days_ago
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 from airflow.models import Variable
 from airflow.configuration import conf
+from airflow.utils import timezone
 
 # =============================================================================
 # CONFIGURATION PARAMETERS (Parameterized via Airflow Variables)
@@ -51,7 +51,7 @@ DAG_ID = os.path.basename(__file__).replace(".py", "")
 default_args = {
     "owner": "airflow",
     "depends_on_past": False,
-    "start_date": days_ago(1),
+    "start_date": timezone.datetime(2024, 1, 1),
     "email_on_failure": False,
     "email_on_retry": False,
     "retries": 1,
