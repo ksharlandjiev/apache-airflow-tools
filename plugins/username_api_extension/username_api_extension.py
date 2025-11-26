@@ -136,7 +136,8 @@ def patch_user() -> Response:
         }), 400
     
     try:
-        data = user_schema.load(request.json)
+        # Use partial=True to allow partial updates (only validate provided fields)
+        data = user_schema.load(request.json, partial=True)
     except ValidationError as e:
         return jsonify({
             'detail': str(e.messages),
