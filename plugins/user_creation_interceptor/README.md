@@ -2,6 +2,8 @@
 
 Demonstrates how to intercept user creation events in Apache Airflow to trigger custom logic such as username sanitization, role assignment, or other automated workflows.
 
+> **Found this tools helpful?** Give us a ⭐ on GitHub to show your support and help others discover these utilities!
+
 ## Overview
 
 Apache Airflow provides limited hooks for customizing user creation behavior. This plugin demonstrates how to use SQLAlchemy event listeners to intercept user creation events and execute custom logic before or after users are created in the database.
