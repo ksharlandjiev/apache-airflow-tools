@@ -2,18 +2,35 @@
 """
 Test script for Username API Extension Plugin with Session Authentication
 Tests CREATE (standard API), GET, PATCH, DELETE (extended API)
+
+Supports both local Airflow and AWS MWAA environments.
+
+Usage:
+    # Local Airflow
+    python3 test_api_session.py
+    
+    # AWS MWAA
+    python3 test_api_session.py --mwaa --env-name my-mwaa-env --region us-east-1
 """
 
 import requests
 import json
 import sys
+import argparse
+import logging
 from urllib.parse import quote
 
-# Configuration
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
+
+# Configuration (can be overridden by command line args)
 BASE_URL = "http://localhost:8080"
 USERNAME = "admin"
 PASSWORD = "test"
 TEST_USERNAME = "assumed-role/TestUser123"
+USE_MWAA = False
+MWAA_ENV_NAME = None
+MWAA_REGION = None
 # Note: requests library auto-encodes params, so we don't manually encode
 
 # Colors
@@ -37,34 +54,133 @@ def print_info(text):
 def pretty_print(data):
     print(json.dumps(data, indent=2))
 
-def get_csrf_token(session):
-    """Get CSRF token from the home page"""
+def get_csrf_token(session, base_url=None):
+    """Get CSRF token from the home page or cookies"""
+    url = base_url or BASE_URL
     try:
-        response = session.get(f"{BASE_URL}/home")
-        if response.status_code == 200:
-            # Try to extract CSRF token from cookies
-            csrf_token = session.cookies.get('csrf_token') or session.cookies.get('_csrf_token')
+        # First, check all cookies for CSRF token
+        for cookie_name in ['csrf_token', '_csrf_token', 'csrftoken', 'CSRF-TOKEN']:
+            csrf_token = session.cookies.get(cookie_name)
             if csrf_token:
+                print_info(f"Found CSRF token in cookie: {cookie_name}")
                 return csrf_token
+        
+        # Try to get from home page
+        response = session.get(f"{url}/home")
+        if response.status_code == 200:
+            # Check cookies again after home page load
+            for cookie_name in ['csrf_token', '_csrf_token', 'csrftoken', 'CSRF-TOKEN']:
+                csrf_token = session.cookies.get(cookie_name)
+                if csrf_token:
+                    print_info(f"Found CSRF token in cookie after /home: {cookie_name}")
+                    return csrf_token
             
             # Try to extract from response headers
-            csrf_token = response.headers.get('X-CSRFToken')
+            csrf_token = response.headers.get('X-CSRFToken') or response.headers.get('X-CSRF-Token')
             if csrf_token:
+                print_info("Found CSRF token in response header")
                 return csrf_token
                 
-            # Try to parse from HTML
+            # Try to parse from HTML (look for various patterns)
             import re
-            match = re.search(r'csrf_token["\s:]+([a-zA-Z0-9\-_]+)', response.text)
+            
+            # Pattern 1: csrf_token = "value"
+            match = re.search(r'csrf_token["\s:=]+["\']([a-zA-Z0-9\-_.]+)["\']', response.text)
             if match:
+                print_info("Found CSRF token in HTML (pattern 1)")
+                return match.group(1)
+            
+            # Pattern 2: name="csrf_token" value="value"
+            match = re.search(r'name=["\']csrf_token["\'][^>]*value=["\']([a-zA-Z0-9\-_.]+)["\']', response.text)
+            if match:
+                print_info("Found CSRF token in HTML (pattern 2)")
+                return match.group(1)
+            
+            # Pattern 3: data-csrf="value"
+            match = re.search(r'data-csrf=["\']([a-zA-Z0-9\-_.]+)["\']', response.text)
+            if match:
+                print_info("Found CSRF token in HTML (pattern 3)")
+                return match.group(1)
+            
+            # Pattern 4: meta tag
+            match = re.search(r'<meta[^>]*name=["\']csrf-token["\'][^>]*content=["\']([a-zA-Z0-9\-_.]+)["\']', response.text, re.IGNORECASE)
+            if match:
+                print_info("Found CSRF token in meta tag")
                 return match.group(1)
         
+        print_info("No CSRF token found")
         return None
     except Exception as e:
         print_error(f"Exception getting CSRF token: {e}")
+        logging.exception("Detailed error:")
         return None
 
+def get_mwaa_session(region, env_name):
+    """
+    Get session for AWS MWAA environment using web login token.
+    
+    Args:
+        region (str): AWS region where MWAA environment is located
+        env_name (str): Name of the MWAA environment
+        
+    Returns:
+        tuple: (session, csrf_token, base_url) or (None, None, None) on failure
+    """
+    try:
+        import boto3
+    except ImportError:
+        print_error("boto3 is required for MWAA authentication. Install it with: pip install boto3")
+        return None, None, None
+    
+    print_header("0. MWAA LOGIN - Get Web Login Token")
+    
+    try:
+        # Create MWAA client
+        mwaa = boto3.client('mwaa', region_name=region)
+        
+        # Request web login token
+        print_info(f"Requesting web login token for environment: {env_name}")
+        response = mwaa.create_web_login_token(Name=env_name)
+        
+        web_server_host_name = response["WebServerHostname"]
+        web_token = response["WebToken"]
+        
+        print_info(f"Web server: {web_server_host_name}")
+        
+        # Construct login URL
+        base_url = f"https://{web_server_host_name}"
+        login_url = f"{base_url}/aws_mwaa/login"
+        login_payload = {"token": web_token}
+        
+        # Create session and authenticate
+        session = requests.Session()
+        response = session.post(login_url, data=login_payload, timeout=10)
+        
+        if response.status_code == 200:
+            print_success("MWAA login successful")
+            session_cookie = session.cookies.get("session")
+            if session_cookie:
+                print_info(f"Session cookie obtained: {session_cookie[:20]}...")
+            
+            # Get CSRF token for MWAA
+            csrf_token = get_csrf_token(session, base_url)
+            if csrf_token:
+                print_info(f"CSRF token obtained: {csrf_token[:20]}...")
+            else:
+                print_info("Warning: No CSRF token found (may cause issues with PATCH/DELETE)")
+            
+            return session, csrf_token, base_url
+        else:
+            print_error(f"Failed to log in: HTTP {response.status_code}")
+            return None, None, None
+            
+    except Exception as e:
+        print_error(f"MWAA login failed: {e}")
+        logging.exception("Detailed error:")
+        return None, None, None
+
 def login():
-    """Login to get session cookie"""
+    """Login to get session cookie (local Airflow)"""
     print_header("0. LOGIN - Get Session Cookie")
     
     session = requests.Session()
@@ -97,7 +213,7 @@ def login():
             print_info(f"Session cookies: {list(session.cookies.keys())}")
             
             # Get CSRF token
-            csrf_token = get_csrf_token(session)
+            csrf_token = get_csrf_token(session, BASE_URL)
             if csrf_token:
                 print_info(f"CSRF token obtained: {csrf_token[:20]}...")
             else:
@@ -218,7 +334,11 @@ def test_patch_user(session, csrf_token=None):
         "first_name": "Updated"
     }
     
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "Referer": f"{BASE_URL}/home",
+        "Origin": BASE_URL
+    }
     if csrf_token:
         headers["X-CSRFToken"] = csrf_token
     
@@ -251,7 +371,11 @@ def test_patch_roles(session, csrf_token=None):
         "roles": [{"name": "Admin"}]
     }
     
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "Referer": f"{BASE_URL}/home",
+        "Origin": BASE_URL
+    }
     if csrf_token:
         headers["X-CSRFToken"] = csrf_token
     
@@ -328,7 +452,10 @@ def test_delete_user(session, csrf_token=None):
     print_header("7. DELETE USER (Extended API)")
     print(f"DELETE {BASE_URL}/api/v1/users-ext/?username={quote(TEST_USERNAME, safe='')}")
     
-    headers = {}
+    headers = {
+        "Referer": f"{BASE_URL}/home",
+        "Origin": BASE_URL
+    }
     if csrf_token:
         headers["X-CSRFToken"] = csrf_token
     
@@ -336,7 +463,7 @@ def test_delete_user(session, csrf_token=None):
         response = session.delete(
             f"{BASE_URL}/api/v1/users-ext/",
             params={"username": TEST_USERNAME},
-            headers=headers if headers else None
+            headers=headers
         )
         
         if response.status_code == 204:
@@ -374,19 +501,96 @@ def test_verify_deletion(session):
         print_error(f"Exception: {e}")
         return False
 
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description='Test Username API Extension Plugin',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Test local Airflow
+  python3 test_api_session.py
+  
+  # Test AWS MWAA
+  python3 test_api_session.py --mwaa --env-name my-mwaa-env --region us-east-1
+  
+  # Test with custom username
+  python3 test_api_session.py --username "domain/testuser"
+        """
+    )
+    
+    parser.add_argument('--mwaa', action='store_true',
+                        help='Use AWS MWAA authentication')
+    parser.add_argument('--env-name', type=str,
+                        help='MWAA environment name (required if --mwaa is set)')
+    parser.add_argument('--region', type=str, default='us-east-1',
+                        help='AWS region (default: us-east-1)')
+    parser.add_argument('--base-url', type=str,
+                        help='Base URL for local Airflow (default: http://localhost:8080)')
+    parser.add_argument('--username', type=str,
+                        help='Test username to create (default: assumed-role/TestUser123)')
+    parser.add_argument('--local-username', type=str, default='admin',
+                        help='Local Airflow username (default: admin)')
+    parser.add_argument('--local-password', type=str, default='test',
+                        help='Local Airflow password (default: test)')
+    
+    return parser.parse_args()
+
 def main():
+    global BASE_URL, USERNAME, PASSWORD, TEST_USERNAME, USE_MWAA, MWAA_ENV_NAME, MWAA_REGION
+    
+    # Parse arguments
+    args = parse_args()
+    
+    # Validate MWAA arguments
+    if args.mwaa and not args.env_name:
+        print_error("--env-name is required when using --mwaa")
+        sys.exit(1)
+    
+    # Set configuration from arguments
+    USE_MWAA = args.mwaa
+    MWAA_ENV_NAME = args.env_name
+    MWAA_REGION = args.region
+    
+    if args.base_url:
+        BASE_URL = args.base_url
+    if args.username:
+        TEST_USERNAME = args.username
+    if args.local_username:
+        USERNAME = args.local_username
+    if args.local_password:
+        PASSWORD = args.local_password
+    
     print("=" * 50)
     print("Username API Extension - Full CRUD Test")
-    print("(Session Authentication)")
+    if USE_MWAA:
+        print("(AWS MWAA Authentication)")
+    else:
+        print("(Session Authentication)")
     print("=" * 50)
+    
+    if USE_MWAA:
+        print_info(f"MWAA Environment: {MWAA_ENV_NAME}")
+        print_info(f"AWS Region: {MWAA_REGION}")
+    else:
+        print_info(f"Base URL: {BASE_URL}")
+    
     print_info(f"Test User: {TEST_USERNAME}")
     print_info(f"URL Encoded: {quote(TEST_USERNAME, safe='')}")
     
-    # Login first
-    session, csrf_token = login()
-    if not session:
-        print_error("Failed to login. Cannot proceed with tests.")
-        sys.exit(1)
+    # Login
+    if USE_MWAA:
+        session, csrf_token, base_url = get_mwaa_session(MWAA_REGION, MWAA_ENV_NAME)
+        if not session:
+            print_error("Failed to login to MWAA. Cannot proceed with tests.")
+            sys.exit(1)
+        # Update BASE_URL for MWAA
+        BASE_URL = base_url
+    else:
+        session, csrf_token = login()
+        if not session:
+            print_error("Failed to login. Cannot proceed with tests.")
+            sys.exit(1)
     
     tests = [
         ("Create User", lambda: test_create_user(session)),

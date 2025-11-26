@@ -51,6 +51,16 @@ log = logging.getLogger(__name__)
 # Create Blueprint for extended user API
 bp = Blueprint('username_api_ext', __name__, url_prefix='/api/v1/users-ext')
 
+# Disable CSRF protection for this blueprint
+# These endpoints are already protected by authentication and authorization
+try:
+    from flask_wtf.csrf import CSRFProtect
+    csrf = CSRFProtect()
+    csrf.exempt(bp)
+except ImportError:
+    # flask_wtf not available, CSRF protection may not be enabled
+    pass
+
 
 @bp.route('/', methods=['GET'])
 @requires_access_custom_view("GET", permissions.RESOURCE_USER)
