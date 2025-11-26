@@ -1,19 +1,35 @@
 # User Creation Interceptor Plugin
 
-Automatically sanitizes usernames containing forward slashes during user creation in Apache Airflow.
+Demonstrates how to intercept user creation events in Apache Airflow to trigger custom logic such as username sanitization, role assignment, or other automated workflows.
 
-## Problem
+## Overview
 
-Flask/Connexion treats `/` as a URL path separator, making usernames like `domain/username` inaccessible via API endpoints such as `/api/v1/users/{username}`.
+Apache Airflow provides limited hooks for customizing user creation behavior. This plugin demonstrates how to use SQLAlchemy event listeners to intercept user creation events and execute custom logic before or after users are created in the database.
 
-## Solution
+**Common use cases:**
+- Automatic role assignment based on user attributes
+- Username validation and policy enforcement
+- Integration with external identity management systems
+- Audit logging and compliance tracking
+- User provisioning workflows
 
-This plugin intercepts user creation and automatically replaces `/` with `_` in usernames, ensuring they work with all Airflow APIs.
+## Example Implementation: Username Sanitization
 
-**Example:**
+The included implementation demonstrates username sanitization by replacing forward slashes with underscores. This addresses a specific limitation where Flask/Connexion treats `/` as a URL path separator, making usernames like `domain/username` inaccessible via API endpoints such as `/api/v1/users/{username}`.
+
+**Example behavior:**
 - User tries to create: `domain/username`
 - Actually created: `domain_username`
-- API access: `/api/v1/users/domain_username` ✅ Works!
+- API access: `/api/v1/users/domain_username` (works correctly)
+
+**Note:** This is just one example implementation. The plugin architecture can be adapted for many other use cases (see Use Cases section below).
+
+## ⚠️ IMPORTANT NOTE FOR MWAA USERS
+**This username sanitization approach will NOT work for AWS MWAA environments.** MWAA relies on exact username matching to map users to IAM identities. Modifying usernames (e.g., changing `assumed-role/roleName` to `assumed-role_roleName`) will break IAM authentication mapping, preventing users from logging in.
+
+**For MWAA environments:**
+- Use the [**Username API Extension**](../username_api_extension/) plugin instead to preserve exact usernames
+- Or use this plugin as a template for other user creation workflows (see Use Cases below)
 
 ## Installation
 
@@ -238,12 +254,12 @@ auth_manager = airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManage
 
 ## Features
 
-✅ **Automatic** - Works without configuration  
-✅ **Non-invasive** - No Airflow code changes  
-✅ **Logged** - All transformations recorded  
-✅ **Tested** - Includes test suite  
-✅ **Customizable** - Easy to modify  
-✅ **Production-ready** - Handles edge cases  
+- **Automatic** - Works without configuration
+- **Non-invasive** - No Airflow code changes
+- **Logged** - All transformations recorded
+- **Tested** - Includes test suite
+- **Customizable** - Easy to modify
+- **Production-ready** - Handles edge cases  
 
 ## Compatibility
 
@@ -251,6 +267,7 @@ auth_manager = airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManage
 - **Python:** 3.8+
 - **Auth Manager:** FAB (Flask-AppBuilder)
 - **Database:** PostgreSQL, MySQL, SQLite
+- **⚠️ MWAA:** Username sanitization NOT compatible (breaks IAM mapping). Use for other workflows only.
 
 ## Performance
 
@@ -261,28 +278,108 @@ auth_manager = airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManage
 
 ## Security
 
-- ✅ All changes logged for audit
-- ✅ Original username preserved in logs
-- ✅ No data loss
-- ✅ Idempotent operation
-- ✅ Non-breaking for existing users
+- All changes logged for audit
+- Original username preserved in logs
+- No data loss
+- Idempotent operation
+- Non-breaking for existing users
+
+## Use Cases
+
+This plugin demonstrates the user creation interception pattern, which can be adapted for various scenarios:
+
+### Username Sanitization (Demonstrated)
+- Automatically clean special characters from usernames
+- Enforce username conventions
+- **Note:** Not suitable for MWAA (breaks IAM mapping)
+
+### Automatic Role Assignment
+```python
+@event.listens_for(User, 'before_insert')
+def auto_assign_roles(mapper, connection, target):
+    """Assign roles based on email domain or username pattern"""
+    if target.email.endswith('@admin.company.com'):
+        # Assign admin role automatically
+        admin_role = security_manager.find_role('Admin')
+        target.roles = [admin_role]
+    elif target.email.endswith('@company.com'):
+        # Assign viewer role for regular employees
+        viewer_role = security_manager.find_role('Viewer')
+        target.roles = [viewer_role]
+```
+
+### User Provisioning Workflows
+```python
+@event.listens_for(User, 'after_insert')
+def trigger_provisioning(mapper, connection, target):
+    """Trigger external provisioning systems"""
+    # Send notification to Slack
+    # Create home directory in S3
+    # Add user to monitoring systems
+    # Send welcome email
+```
+
+### Audit and Compliance
+```python
+@event.listens_for(User, 'before_insert')
+def audit_user_creation(mapper, connection, target):
+    """Log user creation for compliance"""
+    audit_log.info(f"New user created: {target.username} by {current_user}")
+    # Send to SIEM system
+    # Update compliance database
+```
+
+### Username Validation
+```python
+@event.listens_for(User, 'before_insert')
+def validate_username(mapper, connection, target):
+    """Enforce username policies"""
+    if not re.match(r'^[a-zA-Z0-9_-]+$', target.username):
+        raise ValueError("Username must contain only alphanumeric, underscore, or dash")
+    if len(target.username) < 3:
+        raise ValueError("Username must be at least 3 characters")
+```
+
+### Integration with External Systems
+```python
+@event.listens_for(User, 'after_insert')
+def sync_to_external_systems(mapper, connection, target):
+    """Sync user to external identity providers"""
+    # Update LDAP
+    # Sync to Active Directory
+    # Update SSO provider
+    # Create Jira account
+```
 
 ## When to Use This Plugin
 
-✅ **Use this plugin if:**
-- You're setting up a new Airflow instance
+**Use this plugin pattern for:**
+- Automatic role assignment based on user attributes
+- Triggering provisioning workflows
+- Enforcing username policies and validation
+- Audit logging and compliance tracking
+- Integration with external identity systems
+- Custom user creation workflows
+
+**Use the username sanitization example if:**
+- You're setting up a new self-hosted Airflow instance (not MWAA)
 - You control user creation process
 - You want automatic sanitization
 - You're okay with modified usernames
 
-❌ **Don't use this plugin if:**
-- You must preserve exact usernames
+**Don't use username sanitization if:**
+- You're using AWS MWAA (breaks IAM authentication)
+- You must preserve exact usernames for SSO/LDAP
 - You're using a custom auth manager
-- You have existing users with slashes that can't be renamed
+- You have existing users with special characters that can't be renamed
 
-## Alternative Solution
+## Alternative Solutions
 
-If you need to preserve exact usernames with slashes, see the **Username API Extension** plugin which provides alternative API endpoints using query parameters.
+### For MWAA or Exact Username Preservation
+If you need to preserve exact usernames with slashes (especially for MWAA), see the [**Username API Extension**](../username_api_extension/) plugin which provides alternative API endpoints using query parameters.
+
+### For Other Use Cases
+Adapt the event listener pattern shown in this plugin to implement your specific user creation workflow.
 
 ## Files
 
@@ -312,4 +409,4 @@ airflow webserver -D && airflow scheduler -D
 airflow plugins | grep user_creation_interceptor
 ```
 
-**That's it!** The plugin is now active and will automatically sanitize usernames.
+The plugin is now active and will execute your custom logic on user creation.
