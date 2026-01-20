@@ -41,7 +41,7 @@ import socket
 # ============================================================================
 # CONFIGURATION - UPDATE THIS!
 # ============================================================================
-S3_BUCKET = "awskamen-qrt-mwaa"
+S3_BUCKET = "your-mwaa-s3-bucket-name"
 S3_COMMAND_PREFIX = "debug-shell/commands/"
 S3_RESULT_PREFIX = "debug-shell/results/"
 # ============================================================================
