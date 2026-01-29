@@ -24,6 +24,7 @@ NC='\033[0m' # No Color
 # Deployment flags
 RUN_VPC=false
 RUN_UPLOAD=false
+RUN_LAMBDA_LAYER=false
 RUN_ALB=false
 RUN_LAMBDA_UPDATE=false
 RUN_LAMBDA_CODE_UPDATE=false
@@ -43,6 +44,11 @@ while [[ $# -gt 0 ]]; do
             ;;
         --upload)
             RUN_UPLOAD=true
+            RUN_ALL=false
+            shift
+            ;;
+        --lambda-layer)
+            RUN_LAMBDA_LAYER=true
             RUN_ALL=false
             shift
             ;;
@@ -77,6 +83,7 @@ while [[ $# -gt 0 ]]; do
             echo "  ./deploy-stack.sh --vpc-stack my-vpc --alb-stack my-alb  # Custom stack names"
             echo "  ./deploy-stack.sh --vpc                              # Deploy VPC stack only"
             echo "  ./deploy-stack.sh --upload                           # Upload files to S3 only"
+            echo "  ./deploy-stack.sh --lambda-layer                     # Build and deploy Lambda layer only"
             echo "  ./deploy-stack.sh --alb                              # Deploy ALB stack only"
             echo "  ./deploy-stack.sh --update-lambda                    # Update Lambda environment variables only"
             echo "  ./deploy-stack.sh --update-lambda-code               # Update Lambda function code only"
@@ -90,6 +97,7 @@ while [[ $# -gt 0 ]]; do
             echo "Steps:"
             echo "  --vpc      Deploy VPC and MWAA infrastructure stack"
             echo "  --upload   Upload Lambda code and DAG files to S3"
+            echo "  --lambda-layer  Build and deploy Lambda layer with psycopg2"
             echo "  --alb      Deploy ALB and authentication stack"
             echo "  --update-lambda  Update Lambda environment variables only"
             echo "  --update-lambda-code  Update Lambda function code only"
@@ -120,6 +128,7 @@ done
 if [[ "$RUN_ALL" == true ]]; then
     RUN_VPC=true
     RUN_UPLOAD=true
+    RUN_LAMBDA_LAYER=true
     RUN_ALB=true
 fi
 
@@ -160,6 +169,14 @@ check_prerequisites() {
     
     if [[ ! -f "lambda_auth/lambda_mwaa-authorizer.py" ]]; then
         missing_files+=("lambda_auth/lambda_mwaa-authorizer.py")
+    fi
+    
+    if [[ ! -f "lambda_auth/mwaa_database_manager.py" ]]; then
+        missing_files+=("lambda_auth/mwaa_database_manager.py")
+    fi
+    
+    if [[ ! -f "lambda_auth/Dockerfile" ]]; then
+        missing_files+=("lambda_auth/Dockerfile")
     fi
     
     if [[ ! -f "role_creation_dag/create_role_glue_job_dag.py" ]]; then
@@ -321,6 +338,142 @@ upload_files_to_s3() {
         --content-type "text/x-python"
     
     print_success "Files uploaded successfully"
+}
+
+# Function to build and deploy Lambda layer
+build_and_deploy_lambda_layer() {
+    print_status "Building and deploying Lambda layer with psycopg2..."
+    
+    # Get S3 bucket name
+    local bucket_name=$(get_s3_bucket_name)
+    print_status "Using S3 bucket: $bucket_name"
+    
+    # Check if Docker is available
+    if ! command -v docker &> /dev/null; then
+        print_error "Docker is required to build the Lambda layer"
+        print_error "Please install Docker: https://docs.docker.com/get-docker/"
+        return 1
+    fi
+    
+    # Check if Dockerfile exists
+    if [[ ! -f "lambda_auth/Dockerfile" ]]; then
+        print_error "Dockerfile not found at lambda_auth/Dockerfile"
+        return 1
+    fi
+    
+    local layer_dir="lambda_auth/lambda-layer"
+    local zip_file="lambda_auth/psycopg2-layer.zip"
+    
+    # Clean up existing layer directory and zip
+    if [[ -d "$layer_dir" ]]; then
+        print_status "Cleaning up existing layer directory..."
+        rm -rf "$layer_dir"
+    fi
+    
+    if [[ -f "$zip_file" ]]; then
+        print_status "Removing existing layer zip..."
+        rm -f "$zip_file"
+    fi
+    
+    # Build Docker image
+    print_status "Building Docker image with Lambda runtime (this may take a few minutes)..."
+    if ! docker build -t psycopg2-layer lambda_auth/ > /dev/null 2>&1; then
+        print_error "Docker build failed"
+        return 1
+    fi
+    
+    print_success "Docker image built successfully"
+    
+    # Extract layer from Docker container
+    print_status "Extracting layer from Docker container..."
+    docker create --name psycopg2-container psycopg2-layer > /dev/null 2>&1
+    docker cp psycopg2-container:/layer/. "$layer_dir/" > /dev/null 2>&1
+    
+    # Clean up Docker resources
+    docker rm psycopg2-container > /dev/null 2>&1
+    docker rmi psycopg2-layer > /dev/null 2>&1
+    
+    # Create zip file
+    print_status "Creating layer zip file..."
+    (cd "$layer_dir" && zip -r "../psycopg2-layer.zip" . -q)
+    
+    if [[ $? -ne 0 ]]; then
+        print_error "Failed to create layer zip file"
+        rm -rf "$layer_dir"
+        return 1
+    fi
+    
+    # Get zip file size
+    local zip_size=$(du -h "$zip_file" | cut -f1)
+    print_success "Lambda layer built successfully (Size: $zip_size)"
+    
+    # Clean up layer directory
+    rm -rf "$layer_dir"
+    
+    # Upload to S3
+    print_status "Uploading Lambda layer to S3..."
+    if ! aws s3 cp "$zip_file" "s3://$bucket_name/lambda-layers/psycopg2-layer.zip"; then
+        print_error "Failed to upload Lambda layer to S3"
+        return 1
+    fi
+    
+    print_success "Lambda layer uploaded to S3"
+    
+    # Publish Lambda layer
+    print_status "Publishing Lambda layer..."
+    local layer_output=$(aws lambda publish-layer-version \
+        --layer-name mwaa-psycopg2 \
+        --description 'PostgreSQL adapter for MWAA authorizer' \
+        --content S3Bucket="$bucket_name",S3Key=lambda-layers/psycopg2-layer.zip \
+        --compatible-runtimes python3.11 python3.12 \
+        --query '{LayerVersionArn: LayerVersionArn, Version: Version}' \
+        --output json 2>&1)
+    
+    if [[ $? -ne 0 ]]; then
+        print_error "Failed to publish Lambda layer"
+        echo "$layer_output"
+        return 1
+    fi
+    
+    local layer_arn=$(echo "$layer_output" | jq -r '.LayerVersionArn')
+    local layer_version=$(echo "$layer_output" | jq -r '.Version')
+    
+    print_success "Lambda layer published successfully"
+    print_status "Layer ARN: $layer_arn"
+    print_status "Layer Version: $layer_version"
+    
+    # Get Lambda function name from ALB stack (if it exists)
+    local lambda_name=$(aws cloudformation describe-stacks \
+        --stack-name "$ALB_STACK_NAME" \
+        --query 'Stacks[0].Outputs[?OutputKey==`LambdaFunctionName`].OutputValue' \
+        --output text 2>/dev/null)
+    
+    if [[ -n "$lambda_name" && "$lambda_name" != "None" ]]; then
+        print_status "Attaching layer to Lambda function: $lambda_name"
+        
+        if aws lambda update-function-configuration \
+            --function-name "$lambda_name" \
+            --layers "$layer_arn" \
+            --query '{FunctionName: FunctionName, Layers: Layers[*].Arn}' \
+            --output json > /dev/null 2>&1; then
+            
+            print_success "Lambda layer attached to function successfully"
+        else
+            print_warning "Could not attach layer to Lambda function (it may not exist yet)"
+            print_status "You can attach it later with:"
+            echo "  aws lambda update-function-configuration \\"
+            echo "    --function-name YOUR-LAMBDA-FUNCTION \\"
+            echo "    --layers $layer_arn"
+        fi
+    else
+        print_warning "Lambda function not found (ALB stack may not be deployed yet)"
+        print_status "After deploying the ALB stack, attach the layer with:"
+        echo "  aws lambda update-function-configuration \\"
+        echo "    --function-name YOUR-LAMBDA-FUNCTION \\"
+        echo "    --layers $layer_arn"
+    fi
+    
+    print_success "Lambda layer deployment completed"
 }
 
 # Function to deploy VPC stack
@@ -530,8 +683,39 @@ update_lambda_code() {
     
     print_status "Installing dependencies..."
     
-    # Install dependencies to package directory
-    python3 -m pip install --target "$package_dir" python-jose requests --quiet
+    # Check if Docker is available for building dependencies
+    if command -v docker &> /dev/null; then
+        print_status "Using Docker to build dependencies for Lambda runtime..."
+        
+        # Create a Dockerfile for building dependencies (without psycopg2-binary)
+        cat > "$temp_dir/Dockerfile" << 'EOF'
+FROM public.ecr.aws/lambda/python:3.11
+
+# Install dependencies (psycopg2-binary comes from Lambda layer)
+RUN pip install --target /package python-jose requests
+EOF
+        
+        # Build the Docker image and extract the package
+        docker build -t lambda-deps "$temp_dir" > /dev/null 2>&1
+        
+        if [[ $? -eq 0 ]]; then
+            # Create a container and copy the package
+            container_id=$(docker create lambda-deps)
+            docker cp "$container_id:/package/." "$package_dir/"
+            docker rm "$container_id" > /dev/null 2>&1
+            docker rmi lambda-deps > /dev/null 2>&1
+            
+            print_success "Dependencies built successfully using Docker"
+        else
+            print_warning "Docker build failed, falling back to local pip install"
+            python3 -m pip install --target "$package_dir" python-jose requests --quiet
+        fi
+    else
+        print_warning "Docker not available, using local pip install"
+        
+        # Install dependencies to package directory (without psycopg2-binary)
+        python3 -m pip install --target "$package_dir" python-jose requests --quiet
+    fi
     
     if [[ $? -ne 0 ]]; then
         print_error "Failed to install Lambda dependencies"
@@ -541,8 +725,9 @@ update_lambda_code() {
     
     print_status "Creating deployment package..."
     
-    # Copy Lambda function code
+    # Copy Lambda function code and helper module
     cp lambda_auth/lambda_mwaa-authorizer.py "$package_dir/mwaa_authx_lambda_function.py"
+    cp lambda_auth/mwaa_database_manager.py "$package_dir/mwaa_database_manager.py"
     
     # Create zip file
     local zip_file="$temp_dir/lambda_function.zip"
@@ -675,6 +860,7 @@ main() {
         print_status "Running selected steps:"
         [[ "$RUN_VPC" == true ]] && echo "  ✓ VPC deployment"
         [[ "$RUN_UPLOAD" == true ]] && echo "  ✓ File upload"
+        [[ "$RUN_LAMBDA_LAYER" == true ]] && echo "  ✓ Lambda layer build and deployment"
         [[ "$RUN_ALB" == true ]] && echo "  ✓ ALB deployment"
         [[ "$RUN_LAMBDA_UPDATE" == true ]] && echo "  ✓ Lambda environment update"
         [[ "$RUN_LAMBDA_CODE_UPDATE" == true ]] && echo "  ✓ Lambda code update"
@@ -703,6 +889,13 @@ main() {
         upload_files_to_s3 "$S3_BUCKET_NAME"
     else
         print_status "Skipping file upload"
+    fi
+    
+    # Build and deploy Lambda layer
+    if [[ "$RUN_LAMBDA_LAYER" == true ]]; then
+        build_and_deploy_lambda_layer
+    else
+        print_status "Skipping Lambda layer build and deployment"
     fi
     
     # Deploy ALB stack
@@ -734,12 +927,15 @@ main() {
         echo
         if [[ "$RUN_VPC" == true ]] && [[ "$RUN_UPLOAD" == false ]]; then
             print_warning "Next step: Run './deploy-stack.sh --upload' to upload files to S3"
-        elif [[ "$RUN_UPLOAD" == true ]] && [[ "$RUN_ALB" == false ]]; then
+        elif [[ "$RUN_UPLOAD" == true ]] && [[ "$RUN_LAMBDA_LAYER" == false ]]; then
+            print_warning "Next step: Run './deploy-stack.sh --lambda-layer' to build and deploy Lambda layer"
+        elif [[ "$RUN_LAMBDA_LAYER" == true ]] && [[ "$RUN_ALB" == false ]]; then
             print_warning "Next step: Run './deploy-stack.sh --alb' to deploy ALB stack"
         elif [[ "$RUN_VPC" == true ]] && [[ "$RUN_ALB" == false ]]; then
             print_warning "Next steps:"
             echo "  1. Run './deploy-stack.sh --upload' to upload files to S3"
-            echo "  2. Run './deploy-stack.sh --alb' to deploy ALB stack"
+            echo "  2. Run './deploy-stack.sh --lambda-layer' to build and deploy Lambda layer"
+            echo "  3. Run './deploy-stack.sh --alb' to deploy ALB stack"
         fi
     fi
 }

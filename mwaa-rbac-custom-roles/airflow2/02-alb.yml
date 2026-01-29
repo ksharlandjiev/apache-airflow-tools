@@ -121,6 +121,11 @@ Resources:
             - 'sts:AssumeRole'
             - 'sts:SetSourceIdentity'
           Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-*'
+        - Sid: GlueGetConnection
+          Effect: 'Allow'
+          Action:
+            - 'glue:GetConnection'
+          Resource: '*'
         - Sid: MWAAInvokeRestApi
           Effect: 'Allow'
           Action: 'airflow:InvokeRestApi'
@@ -176,6 +181,8 @@ Resources:
       Timeout: 90
       VpcConfig:
         SecurityGroupIds: 
+          - !ImportValue
+            'Fn::Sub': '${MWAAVPCStackName}-mwaa-sg'
           - !ImportValue
             'Fn::Sub': '${MWAAVPCStackName}-alb-sg'
         SubnetIds: 
