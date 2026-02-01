@@ -327,3 +327,155 @@ class MWAADatabaseManager:
         exists = self.cursor.fetchone() is not None
         logger.info(f'User "{username}" exists: {exists}')
         return exists
+
+    def role_exists(self, role_name):
+        """
+        Check if a role exists.
+        
+        Args:
+            role_name: Role name to check
+        
+        Returns:
+            bool: True if role exists, False otherwise
+        """
+        self.cursor.execute(
+            "SELECT 1 FROM ab_role WHERE name = %s",
+            (role_name,)
+        )
+        exists = self.cursor.fetchone() is not None
+        logger.info(f'Role "{role_name}" exists: {exists}')
+        return exists
+    
+    def create_custom_role(self, role_name, source_role='User', specific_dags=None):
+        """
+        Create a custom MWAA role with specific DAG permissions.
+        
+        This method:
+        1. Copies all non-DAG permissions from the source role
+        2. Adds permissions for specific DAGs if provided
+        3. Adds "menu access on DAGs" permission
+        
+        Args:
+            role_name: Name of the custom role to create
+            source_role: Base role to copy permissions from (default: 'User')
+            specific_dags: List of DAG names to grant access to (e.g., ['dag1', 'dag2'])
+                          If None or empty, no DAG-specific permissions are added
+        
+        Returns:
+            bool: True if role created successfully, False otherwise
+        """
+        try:
+            logger.info(f'Creating custom role: {role_name} from {source_role}')
+            logger.info(f'Specific DAGs: {specific_dags}')
+            
+            # Step 1: Check if role already exists
+            if self.role_exists(role_name):
+                logger.info(f'Role "{role_name}" already exists, skipping creation')
+                return True
+            
+            # Step 2: Get source role ID
+            self.cursor.execute("SELECT id FROM ab_role WHERE name = %s", (source_role,))
+            source_role_data = self.cursor.fetchone()
+            
+            if not source_role_data:
+                logger.error(f'Source role "{source_role}" not found')
+                return False
+            
+            source_role_id = source_role_data[0]
+            logger.info(f'✓ Found source role "{source_role}" with ID: {source_role_id}')
+            
+            # Step 3: Get permissions from source role (excluding wildcard DAG permissions)
+            self.cursor.execute(
+                """
+                SELECT pv.id as permission_view_id
+                FROM ab_role r
+                JOIN ab_permission_view_role pvr ON r.id = pvr.role_id
+                JOIN ab_permission_view pv ON pvr.permission_view_id = pv.id
+                JOIN ab_view_menu vm ON pv.view_menu_id = vm.id
+                JOIN ab_permission p ON pv.permission_id = p.id
+                WHERE r.id = %s 
+                  AND vm.name NOT LIKE 'DAG:%%'
+                  AND vm.name NOT LIKE 'DAGs%%'
+                """,
+                (source_role_id,)
+            )
+            
+            non_dag_perms = self.cursor.fetchall()
+            permission_view_ids = [perm[0] for perm in non_dag_perms]
+            
+            logger.info(f'✓ Found {len(permission_view_ids)} non-DAG permissions from source role')
+            
+            # Step 4: Add DAG-specific permissions if specified
+            if specific_dags:
+                logger.info(f'Adding permissions for specific DAGs: {specific_dags}')
+                
+                # Get permissions for specific DAGs
+                dag_names = [f'DAG:{dag}' for dag in specific_dags]
+                placeholders = ','.join(['%s'] * len(dag_names))
+                
+                self.cursor.execute(
+                    f"""
+                    SELECT pv.id as permission_view_id
+                    FROM ab_permission_view pv
+                    JOIN ab_view_menu vm ON pv.view_menu_id = vm.id
+                    WHERE vm.name IN ({placeholders})
+                    """,
+                    tuple(dag_names)
+                )
+                
+                dag_perms = self.cursor.fetchall()
+                dag_perm_ids = [perm[0] for perm in dag_perms]
+                permission_view_ids.extend(dag_perm_ids)
+                
+                logger.info(f'✓ Added {len(dag_perm_ids)} DAG-specific permissions')
+                
+                # Add "menu access on DAGs" permission
+                self.cursor.execute(
+                    """
+                    SELECT pv.id as permission_view_id
+                    FROM ab_permission_view pv
+                    JOIN ab_view_menu vm ON pv.view_menu_id = vm.id
+                    JOIN ab_permission p ON pv.permission_id = p.id
+                    WHERE vm.name = 'DAGs' AND p.name like 'menu%'
+                    """
+                )
+                
+                dags_menu_perm = self.cursor.fetchone()
+                if dags_menu_perm:
+                    permission_view_ids.append(dags_menu_perm[0])
+                    logger.info('✓ Added DAGs menu access permission')
+            
+            logger.info(f'Total permissions to assign: {len(permission_view_ids)}')
+            
+            # Step 5: Get next role ID
+            self.cursor.execute("SELECT MAX(id) as max_id FROM ab_role")
+            max_id_result = self.cursor.fetchone()
+            max_id = max_id_result[0] if max_id_result[0] else 0
+            new_role_id = max_id + 1
+            
+            logger.info(f'New role ID: {new_role_id}')
+            
+            # Step 6: Create the new role
+            self.cursor.execute(
+                "INSERT INTO ab_role (id, name) VALUES (%s, %s)",
+                (new_role_id, role_name)
+            )
+            logger.info(f'✓ Created role "{role_name}" with ID: {new_role_id}')
+            
+            # Step 7: Assign permissions to the new role
+            for pv_id in permission_view_ids:
+                self.cursor.execute(
+                    "INSERT INTO ab_permission_view_role (permission_view_id, role_id) VALUES (%s, %s)",
+                    (pv_id, new_role_id)
+                )
+            
+            logger.info(f'✓ Assigned {len(permission_view_ids)} permissions to role "{role_name}"')
+            logger.info(f'✓ Successfully created custom role "{role_name}"')
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f'Error creating custom role: {e}')
+            import traceback
+            logger.error(f'Traceback: {traceback.format_exc()}')
+            return False

@@ -28,11 +28,17 @@ RUN_LAMBDA_LAYER=false
 RUN_ALB=false
 RUN_LAMBDA_UPDATE=false
 RUN_LAMBDA_CODE_UPDATE=false
+RUN_AZURE_SSO=false
+RUN_CREATE_CERT=false
 RUN_ALL=true
 
 # Stack names (defaults)
 VPC_STACK_NAME=""
 ALB_STACK_NAME=""
+
+# Azure SSO URLs (populated by setup_azure_sso function)
+AZURE_METADATA_URL=""
+AZURE_LOGIN_URL=""
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -67,6 +73,14 @@ while [[ $# -gt 0 ]]; do
             RUN_ALL=false
             shift
             ;;
+        --setup-azure-sso)
+            RUN_AZURE_SSO=true
+            shift
+            ;;
+        --create-cert)
+            RUN_CREATE_CERT=true
+            shift
+            ;;
         --vpc-stack)
             VPC_STACK_NAME="$2"
             shift 2
@@ -88,11 +102,15 @@ while [[ $# -gt 0 ]]; do
             echo "  ./deploy-stack.sh --update-lambda                    # Update Lambda environment variables only"
             echo "  ./deploy-stack.sh --update-lambda-code               # Update Lambda function code only"
             echo "  ./deploy-stack.sh --vpc --upload                     # Deploy VPC and upload files"
+            echo "  ./deploy-stack.sh --setup-azure-sso                  # Setup Azure SSO (run after VPC deployment)"
+            echo "  ./deploy-stack.sh --create-cert                      # Create and import SSL certificate to ACM"
             echo "  ./deploy-stack.sh --help                             # Show this help message"
             echo ""
             echo "Options:"
             echo "  --vpc-stack NAME    VPC stack name (default: mwaa-vpc)"
             echo "  --alb-stack NAME    ALB stack name (default: <vpc-stack>-alb)"
+            echo "  --setup-azure-sso   Setup Azure Enterprise Application for SAML SSO"
+            echo "  --create-cert       Create self-signed certificate and import to ACM"
             echo ""
             echo "Steps:"
             echo "  --vpc      Deploy VPC and MWAA infrastructure stack"
@@ -109,10 +127,19 @@ while [[ $# -gt 0 ]]; do
             echo "  # Full deployment with custom stack names"
             echo "  ./deploy-stack.sh --vpc-stack my-mwaa-vpc --alb-stack my-mwaa-alb"
             echo ""
+            echo "  # Full deployment with Azure SSO setup"
+            echo "  ./deploy-stack.sh --vpc-stack my-vpc --alb-stack my-alb --setup-azure-sso"
+            echo ""
+            echo "  # Create SSL certificate and deploy"
+            echo "  ./deploy-stack.sh --vpc-stack my-vpc --alb-stack my-alb --create-cert"
+            echo ""
             echo "  # Deploy VPC with custom name, then upload files, then deploy ALB"
             echo "  ./deploy-stack.sh --vpc-stack my-vpc --vpc"
             echo "  ./deploy-stack.sh --vpc-stack my-vpc --upload"
             echo "  ./deploy-stack.sh --vpc-stack my-vpc --alb-stack my-alb --alb"
+            echo ""
+            echo "  # Setup Azure SSO after VPC deployment"
+            echo "  ./deploy-stack.sh --vpc-stack my-vpc --setup-azure-sso"
             echo ""
             exit 0
             ;;
@@ -206,6 +233,76 @@ check_prerequisites() {
     print_success "All prerequisites met"
 }
 
+# Function to create and import SSL certificate to ACM
+create_and_import_certificate() {
+    print_status "Creating self-signed SSL certificate for ALB..."
+    
+    # Check if openssl is available
+    if ! command -v openssl &> /dev/null; then
+        print_error "OpenSSL is not installed. Please install it first."
+        return 1
+    fi
+    
+    local cert_dir="ssl-certs"
+    mkdir -p "$cert_dir"
+    
+    local private_key="$cert_dir/private-key.pem"
+    local certificate="$cert_dir/certificate.pem"
+    
+    # Generate self-signed certificate
+    print_status "Generating self-signed certificate (valid for 365 days)..."
+    openssl req -x509 -newkey rsa:2048 \
+        -keyout "$private_key" \
+        -out "$certificate" \
+        -days 365 \
+        -nodes \
+        -subj "/C=US/ST=Virginia/L=Arlington/O=MWAA/CN=*.elb.amazonaws.com" \
+        2>/dev/null
+    
+    if [[ $? -ne 0 ]]; then
+        print_error "Failed to generate certificate"
+        return 1
+    fi
+    
+    print_success "Certificate generated successfully"
+    
+    # Import certificate to ACM
+    print_status "Importing certificate to AWS Certificate Manager..."
+    local cert_arn=$(aws acm import-certificate \
+        --certificate fileb://"$certificate" \
+        --private-key fileb://"$private_key" \
+        --region "$AWS_REGION" \
+        --query 'CertificateArn' \
+        --output text 2>&1)
+    
+    if [[ $? -ne 0 ]]; then
+        print_error "Failed to import certificate to ACM"
+        echo "$cert_arn"
+        return 1
+    fi
+    
+    print_success "Certificate imported to ACM"
+    print_status "Certificate ARN: $cert_arn"
+    
+    # Update deployment-config.json with certificate ARN
+    print_status "Updating deployment-config.json with certificate ARN..."
+    local temp_config=$(mktemp)
+    jq --arg cert_arn "$cert_arn" '
+        map(if .ParameterKey == "ALBCertificateArn" then .ParameterValue = $cert_arn else . end)
+    ' deployment-config.json > "$temp_config"
+    mv "$temp_config" deployment-config.json
+    
+    print_success "Updated deployment-config.json with certificate ARN"
+    
+    # Store certificate ARN for later use
+    echo "$cert_arn" > "$cert_dir/certificate-arn.txt"
+    
+    print_status "Certificate files saved in: $cert_dir/"
+    print_warning "Note: This is a self-signed certificate. For production, use a certificate from a trusted CA."
+    
+    return 0
+}
+
 # Function to parse deployment configuration
 parse_config() {
     print_status "Parsing deployment configuration..."
@@ -215,9 +312,6 @@ parse_config() {
         exit 1
     fi
     
-    # Extract MWAA environment name from config
-    MWAA_ENV_NAME=$(jq -r '.[] | select(.ParameterKey=="MWAAEnvironmentName") | .ParameterValue' deployment-config.json 2>/dev/null || echo "mwaa-env")
-    
     # Set default stack names if not provided
     if [[ -z "$VPC_STACK_NAME" ]]; then
         VPC_STACK_NAME="mwaa-vpc"
@@ -226,6 +320,17 @@ parse_config() {
     if [[ -z "$ALB_STACK_NAME" ]]; then
         ALB_STACK_NAME="${VPC_STACK_NAME}-alb"
     fi
+    
+    # Use VPC stack name as MWAA environment name
+    MWAA_ENV_NAME="$VPC_STACK_NAME"
+    
+    # Update MWAAEnvironmentName in deployment-config.json to match VPC stack name
+    print_status "Updating MWAAEnvironmentName in deployment-config.json to: $MWAA_ENV_NAME"
+    local temp_config=$(mktemp)
+    jq --arg env_name "$MWAA_ENV_NAME" '
+        map(if .ParameterKey == "MWAAEnvironmentName" then .ParameterValue = $env_name else . end)
+    ' deployment-config.json > "$temp_config"
+    mv "$temp_config" deployment-config.json
     
     AWS_REGION=$(aws configure get region || echo "us-east-1")
     
@@ -314,8 +419,17 @@ upload_files_to_s3() {
     aws s3 cp lambda_auth/lambda_mwaa-authorizer.py "s3://$bucket_name/lambda-code/lambda_mwaa-authorizer.py" \
         --content-type "text/x-python"
     
+    print_status "Uploading mwaa_database_manager.py..."
+    aws s3 cp lambda_auth/mwaa_database_manager.py "s3://$bucket_name/lambda-code/mwaa_database_manager.py" \
+        --content-type "text/x-python"
+    
     # Upload DAG files
     print_status "Uploading DAG files..."
+    
+    # Upload create_glue_connection_dag.py
+    print_status "  - create_glue_connection_dag.py..."
+    aws s3 cp role_creation_dag/create_glue_connection_dag.py "s3://$bucket_name/dags/create_glue_connection_dag.py" \
+        --content-type "text/x-python"
     
     # Upload create_role_glue_job_dag.py with stack name replacement
     print_status "  - create_role_glue_job_dag.py (replacing {{VPC_STACK_NAME}} with $VPC_STACK_NAME)..."
@@ -513,6 +627,236 @@ deploy_vpc_stack() {
     print_success "VPC stack deployed successfully"
 }
 
+# Function to setup Azure SSO
+setup_azure_sso() {
+    print_status "Setting up Azure Enterprise Application for SAML SSO..."
+    
+    # Check if Python 3 is available
+    if ! command -v python3 &> /dev/null; then
+        print_error "Python 3 is required for Azure SSO setup"
+        return 1
+    fi
+    
+    # Check if azure_sso directory exists
+    if [[ ! -d "azure_sso" ]]; then
+        print_error "azure_sso directory not found"
+        return 1
+    fi
+    
+    # Check if create_nongallery_saml_app.py exists
+    if [[ ! -f "azure_sso/create_nongallery_saml_app.py" ]]; then
+        print_error "azure_sso/create_nongallery_saml_app.py not found"
+        return 1
+    fi
+    
+    # Check if required Python packages are installed
+    print_status "Checking Python dependencies..."
+    
+    # Always use virtual environment for Azure SSO
+    if [[ ! -d "azure_sso/.venv" ]]; then
+        print_status "Creating Python virtual environment..."
+        python3 -m venv azure_sso/.venv
+        
+        if [[ $? -ne 0 ]]; then
+            print_error "Failed to create virtual environment"
+            return 1
+        fi
+    fi
+    
+    # Install/update dependencies in virtual environment
+    print_status "Installing/updating dependencies in virtual environment..."
+    azure_sso/.venv/bin/pip install -q --upgrade pip
+    azure_sso/.venv/bin/pip install -q -r azure_sso/requirements.txt
+    
+    if [[ $? -ne 0 ]]; then
+        print_error "Failed to install Python dependencies"
+        return 1
+    fi
+    
+    print_success "Python dependencies ready"
+    
+    # Get Cognito User Pool ID from VPC stack outputs
+    print_status "Retrieving Cognito User Pool ID from VPC stack..."
+    local user_pool_id=$(aws cloudformation describe-stacks \
+        --stack-name "$VPC_STACK_NAME" \
+        --query 'Stacks[0].Outputs[?OutputKey==`UserPoolId`].OutputValue' \
+        --output text 2>/dev/null)
+    
+    if [[ -z "$user_pool_id" || "$user_pool_id" == "None" ]]; then
+        print_error "Could not retrieve Cognito User Pool ID from VPC stack"
+        return 1
+    fi
+    
+    print_status "Cognito User Pool ID: $user_pool_id"
+    
+    # Get Cognito Domain from VPC stack outputs
+    print_status "Retrieving Cognito Domain from VPC stack..."
+    local cognito_domain=$(aws cloudformation describe-stacks \
+        --stack-name "$VPC_STACK_NAME" \
+        --query 'Stacks[0].Outputs[?OutputKey==`UserPoolDomain`].OutputValue' \
+        --output text 2>/dev/null)
+    
+    if [[ -z "$cognito_domain" || "$cognito_domain" == "None" ]]; then
+        print_error "Could not retrieve Cognito Domain from VPC stack"
+        return 1
+    fi
+    
+    print_status "Cognito Domain: $cognito_domain"
+    
+    # Get ALB DNS from VPC stack outputs
+    print_status "Retrieving ALB DNS from VPC stack..."
+    local alb_dns=$(aws cloudformation describe-stacks \
+        --stack-name "$VPC_STACK_NAME" \
+        --query 'Stacks[0].Outputs[?OutputKey==`ApplicationLoadBalancerUrl`].OutputValue' \
+        --output text 2>/dev/null)
+    
+    if [[ -z "$alb_dns" || "$alb_dns" == "None" ]]; then
+        print_error "Could not retrieve ALB DNS from VPC stack"
+        return 1
+    fi
+    
+    print_status "ALB DNS: $alb_dns"
+    
+    # Construct URLs
+    local entity_id="urn:amazon:cognito:sp:${user_pool_id}"
+    local reply_url="https://${cognito_domain}.auth.${AWS_REGION}.amazoncognito.com/saml2/idpresponse"
+    local sign_on_url="https://${alb_dns}"
+    
+    print_status "Calling Azure SSO setup script..."
+    print_status "  Entity ID: $entity_id"
+    print_status "  Reply URL: $reply_url"
+    print_status "  Sign-on URL: $sign_on_url"
+    print_status "  Stack Name: $VPC_STACK_NAME"
+    echo
+    
+    # Always use virtual environment Python
+    local python_cmd="azure_sso/.venv/bin/python3"
+    
+    # Capture the output
+    local azure_output=$(mktemp)
+    local azure_json=$(mktemp)
+    
+    if $python_cmd azure_sso/create_nongallery_saml_app.py \
+        --name "MWAA-Cognito-SAML" \
+        --entity-id "$entity_id" \
+        --reply-url "$reply_url" \
+        --sign-on-url "$sign_on_url" \
+        --stack-name "$VPC_STACK_NAME" 2>&1 | tee "$azure_output"; then
+        
+        print_success "Azure SSO setup completed"
+        
+        # Extract JSON output from the script (between the JSON Output markers)
+        # The JSON is printed between two separator lines after "JSON Output (for automation):"
+        local json_start=$(grep -n "^JSON Output (for automation):$" "$azure_output" | tail -1 | cut -d: -f1)
+        
+        if [[ -n "$json_start" ]]; then
+            # Find the start of JSON (after the separator line)
+            local json_start_line=$((json_start + 2))
+            
+            # Extract everything from json_start_line to the last separator line
+            # First, find the line number of the last separator
+            local last_separator=$(grep -n "^=\+$" "$azure_output" | tail -1 | cut -d: -f1)
+            
+            if [[ -n "$last_separator" ]] && [[ $last_separator -gt $json_start_line ]]; then
+                local json_end_line=$((last_separator - 1))
+                
+                # Extract JSON lines (they may be wrapped)
+                sed -n "${json_start_line},${json_end_line}p" "$azure_output" > "$azure_json"
+                
+                # Try to parse as-is first (in case it's already valid JSON)
+                if jq empty "$azure_json" 2>/dev/null; then
+                    # Parse JSON to extract URLs
+                    AZURE_METADATA_URL=$(jq -r '.metadata_url' "$azure_json")
+                    AZURE_LOGIN_URL=$(jq -r '.login_url' "$azure_json")
+                    local cert_thumbprint=$(jq -r '.certificate_thumbprint // empty' "$azure_json")
+                    local cert_expiration=$(jq -r '.certificate_expiration // empty' "$azure_json")
+                    
+                    if [[ -n "$AZURE_METADATA_URL" ]] && [[ "$AZURE_METADATA_URL" != "null" ]]; then
+                        print_success "Extracted Metadata URL: $AZURE_METADATA_URL"
+                    else
+                        print_warning "Could not extract Metadata URL from JSON output"
+                    fi
+                    
+                    if [[ -n "$AZURE_LOGIN_URL" ]] && [[ "$AZURE_LOGIN_URL" != "null" ]]; then
+                        print_success "Extracted Login URL: $AZURE_LOGIN_URL"
+                    else
+                        print_warning "Could not extract Login URL from JSON output"
+                    fi
+                    
+                    if [[ -n "$cert_thumbprint" ]] && [[ "$cert_thumbprint" != "null" ]]; then
+                        print_success "Certificate Thumbprint: $cert_thumbprint"
+                    fi
+                    
+                    if [[ -n "$cert_expiration" ]] && [[ "$cert_expiration" != "null" ]]; then
+                        print_success "Certificate Expiration: $cert_expiration"
+                    fi
+                else
+                    # JSON is wrapped - try to unwrap it
+                    cat "$azure_json" | tr -d '\n' | sed 's/  */ /g' > "${azure_json}.unwrapped"
+                    echo "" >> "${azure_json}.unwrapped"
+                    
+                    if jq empty "${azure_json}.unwrapped" 2>/dev/null; then
+                        # Parse unwrapped JSON
+                        AZURE_METADATA_URL=$(jq -r '.metadata_url' "${azure_json}.unwrapped")
+                        AZURE_LOGIN_URL=$(jq -r '.login_url' "${azure_json}.unwrapped")
+                        local cert_thumbprint=$(jq -r '.certificate_thumbprint // empty' "${azure_json}.unwrapped")
+                        local cert_expiration=$(jq -r '.certificate_expiration // empty' "${azure_json}.unwrapped")
+                        
+                        if [[ -n "$AZURE_METADATA_URL" ]] && [[ "$AZURE_METADATA_URL" != "null" ]]; then
+                            print_success "Extracted Metadata URL: $AZURE_METADATA_URL"
+                        fi
+                        
+                        if [[ -n "$AZURE_LOGIN_URL" ]] && [[ "$AZURE_LOGIN_URL" != "null" ]]; then
+                            print_success "Extracted Login URL: $AZURE_LOGIN_URL"
+                        fi
+                        
+                        if [[ -n "$cert_thumbprint" ]] && [[ "$cert_thumbprint" != "null" ]]; then
+                            print_success "Certificate Thumbprint: $cert_thumbprint"
+                        fi
+                        
+                        if [[ -n "$cert_expiration" ]] && [[ "$cert_expiration" != "null" ]]; then
+                            print_success "Certificate Expiration: $cert_expiration"
+                        fi
+                    else
+                        print_warning "Could not parse JSON output from Azure SSO script"
+                    fi
+                    
+                    rm -f "${azure_json}.unwrapped"
+                fi
+            else
+                print_warning "Could not find JSON end marker in script output"
+            fi
+        else
+            print_warning "Could not find JSON output in script output"
+        fi
+        
+        # Update deployment-config.json with Azure SSO URLs
+        if [[ -n "$AZURE_METADATA_URL" ]] && [[ -n "$AZURE_LOGIN_URL" ]]; then
+            print_status "Updating deployment-config.json with Azure SSO URLs..."
+            local temp_config=$(mktemp)
+            jq --arg metadata_url "$AZURE_METADATA_URL" --arg login_url "$AZURE_LOGIN_URL" '
+                map(
+                    if .ParameterKey == "AppFederationMetadataURL" then .ParameterValue = $metadata_url
+                    elif .ParameterKey == "EntraIDLoginURL" then .ParameterValue = $login_url
+                    else . end
+                )
+            ' deployment-config.json > "$temp_config"
+            mv "$temp_config" deployment-config.json
+            print_success "Updated deployment-config.json with Azure SSO URLs"
+        fi
+        
+        # Clean up temp files
+        rm -f "$azure_output" "$azure_json"
+        
+        return 0
+    else
+        print_error "Azure SSO setup failed"
+        cat "$azure_output"
+        rm -f "$azure_output" "$azure_json"
+        return 1
+    fi
+}
+
 # Function to deploy ALB stack
 deploy_alb_stack() {
     print_status "Deploying ALB stack: $ALB_STACK_NAME"
@@ -520,6 +864,25 @@ deploy_alb_stack() {
     # Filter parameters for ALB template only
     local alb_params=$(mktemp)
     jq '[.[] | select(.ParameterKey | IN("ALBCertificateArn", "AzureAdminGroupID", "AzureUserGroupID", "AzureViewerGroupID", "AzureCustomGroupID", "EntraIDLoginURL", "AppFederationMetadataURL"))]' deployment-config.json > "$alb_params"
+    
+    # Override with Azure SSO URLs if they were set by setup_azure_sso
+    if [[ -n "$AZURE_METADATA_URL" ]]; then
+        print_status "Using Azure Metadata URL from SSO setup: $AZURE_METADATA_URL"
+        local temp_params=$(mktemp)
+        jq --arg metadata_url "$AZURE_METADATA_URL" '
+            map(if .ParameterKey == "AppFederationMetadataURL" then .ParameterValue = $metadata_url else . end)
+        ' "$alb_params" > "$temp_params"
+        mv "$temp_params" "$alb_params"
+    fi
+    
+    if [[ -n "$AZURE_LOGIN_URL" ]]; then
+        print_status "Using Azure Login URL from SSO setup: $AZURE_LOGIN_URL"
+        local temp_params=$(mktemp)
+        jq --arg login_url "$AZURE_LOGIN_URL" '
+            map(if .ParameterKey == "EntraIDLoginURL" then .ParameterValue = $login_url else . end)
+        ' "$alb_params" > "$temp_params"
+        mv "$temp_params" "$alb_params"
+    fi
     
     # Add MWAAVPCStackName parameter
     local temp_params=$(mktemp)
@@ -585,7 +948,7 @@ update_lambda_environment() {
     # Extract existing variables
     local cognito_domain=$(echo "$current_env" | jq -r '.COGNITO_DOMAIN // ""')
     local aws_account_id=$(echo "$current_env" | jq -r '.AWS_ACCOUNT_ID // ""')
-    local mwaa_env_name=$(echo "$current_env" | jq -r '.Amazon_MWAA_ENV_NAME // ""')
+    local mwaa_env_name="$MWAA_ENV_NAME"  # Use VPC stack name as MWAA environment name
     local idp_login_uri=$(echo "$current_env" | jq -r '.IDP_LOGIN_URI // ""')
     local cognito_client_id=$(echo "$current_env" | jq -r '.COGNITO_CLIENT_ID // ""')
     local alb_cookie_name=$(echo "$current_env" | jq -r '.ALB_COOKIE_NAME // "AWSELBAuthSessionCookie"')
@@ -617,22 +980,58 @@ update_lambda_environment() {
     local viewer_group=$(jq -r '.[] | select(.ParameterKey=="AzureViewerGroupID") | .ParameterValue' deployment-config.json)
     local custom_group=$(jq -r '.[] | select(.ParameterKey=="AzureCustomGroupID") | .ParameterValue' deployment-config.json)
     
-    # Build GROUP_TO_ROLE_MAP JSON (using role names, not ARNs - Lambda will construct ARNs)
-    # Create a proper JSON file to avoid shell escaping issues
+    # Extract DAG names from sample_dags folder
+    print_status "Extracting DAG names from sample_dags folder..."
+    local dag_files=$(ls sample_dags/*.py 2>/dev/null | xargs -n1 basename | sed 's/\.py$//')
+    
+    # Build specific_dags JSON array
+    local specific_dags_json="[]"
+    if [[ -n "$dag_files" ]]; then
+        specific_dags_json=$(echo "$dag_files" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+        print_status "Found DAGs for custom role: $specific_dags_json"
+    else
+        print_warning "No DAG files found in sample_dags folder"
+    fi
+    
+    # Build GROUP_TO_ROLE_MAP using jq for proper JSON encoding
+    local group_to_role_map=$(jq -n \
+        --arg admin_group "$admin_group" \
+        --arg admin_role "$admin_role" \
+        --arg user_group "$user_group" \
+        --arg user_role "$user_role" \
+        --arg viewer_group "$viewer_group" \
+        --arg viewer_role "$viewer_role" \
+        --arg custom_group "$custom_group" \
+        --arg custom_role "$custom_role" \
+        --argjson specific_dags "$specific_dags_json" \
+        '[
+            {"idp-group": $admin_group, "iam-role": $admin_role, "mwaa-role": "Admin"},
+            {"idp-group": $user_group, "iam-role": $user_role, "mwaa-role": "User"},
+            {"idp-group": $viewer_group, "iam-role": $viewer_role, "mwaa-role": "Viewer"},
+            {"idp-group": $custom_group, "iam-role": $custom_role, "mwaa-role": "MWAARestrictedTest", "specific_dags": $specific_dags}
+        ]' | jq -c .)
+    
+    # Build environment variables JSON
     local temp_env_file=$(mktemp)
-    cat > "$temp_env_file" <<EOF
-{
-  "Variables": {
-    "COGNITO_DOMAIN": "$cognito_domain",
-    "AWS_ACCOUNT_ID": "$aws_account_id",
-    "Amazon_MWAA_ENV_NAME": "$mwaa_env_name",
-    "GROUP_TO_ROLE_MAP": "[{\"idp-group\":\"$admin_group\",\"iam-role\":\"$admin_role\",\"mwaa-role\":\"Admin\"},{\"idp-group\":\"$user_group\",\"iam-role\":\"$user_role\",\"mwaa-role\":\"User\"},{\"idp-group\":\"$viewer_group\",\"iam-role\":\"$viewer_role\",\"mwaa-role\":\"Viewer\"},{\"idp-group\":\"$custom_group\",\"iam-role\":\"$custom_role\",\"mwaa-role\":\"MWAARestrictedTest\"}]",
-    "IDP_LOGIN_URI": "$idp_login_uri",
-    "COGNITO_CLIENT_ID": "$cognito_client_id",
-    "ALB_COOKIE_NAME": "$alb_cookie_name"
-  }
-}
-EOF
+    jq -n \
+        --arg cognito_domain "$cognito_domain" \
+        --arg aws_account_id "$aws_account_id" \
+        --arg mwaa_env_name "$mwaa_env_name" \
+        --arg group_to_role_map "$group_to_role_map" \
+        --arg idp_login_uri "$idp_login_uri" \
+        --arg cognito_client_id "$cognito_client_id" \
+        --arg alb_cookie_name "$alb_cookie_name" \
+        '{
+            Variables: {
+                COGNITO_DOMAIN: $cognito_domain,
+                AWS_ACCOUNT_ID: $aws_account_id,
+                Amazon_MWAA_ENV_NAME: $mwaa_env_name,
+                GROUP_TO_ROLE_MAP: $group_to_role_map,
+                IDP_LOGIN_URI: $idp_login_uri,
+                COGNITO_CLIENT_ID: $cognito_client_id,
+                ALB_COOKIE_NAME: $alb_cookie_name
+            }
+        }' > "$temp_env_file"
     
     print_status "Updating GROUP_TO_ROLE_MAP..."
     
@@ -858,7 +1257,9 @@ main() {
         print_status "Running all deployment steps"
     else
         print_status "Running selected steps:"
+        [[ "$RUN_CREATE_CERT" == true ]] && echo "  ✓ SSL certificate creation"
         [[ "$RUN_VPC" == true ]] && echo "  ✓ VPC deployment"
+        [[ "$RUN_AZURE_SSO" == true ]] && echo "  ✓ Azure SSO setup"
         [[ "$RUN_UPLOAD" == true ]] && echo "  ✓ File upload"
         [[ "$RUN_LAMBDA_LAYER" == true ]] && echo "  ✓ Lambda layer build and deployment"
         [[ "$RUN_ALB" == true ]] && echo "  ✓ ALB deployment"
@@ -873,11 +1274,59 @@ main() {
     # Parse configuration
     parse_config
     
+    # Create and import SSL certificate if flag is set or if running all steps
+    # Skip if VPC stack already exists (certificate already created)
+    if [[ "$RUN_CREATE_CERT" == true ]] || [[ "$RUN_ALL" == true ]]; then
+        if aws cloudformation describe-stacks --stack-name "$VPC_STACK_NAME" &>/dev/null; then
+            print_status "VPC stack $VPC_STACK_NAME already exists, skipping certificate creation"
+        else
+            create_and_import_certificate
+        fi
+    fi
+    
     # Deploy VPC stack
     if [[ "$RUN_VPC" == true ]]; then
-        deploy_vpc_stack
+        # Check if stack exists
+        if aws cloudformation describe-stacks --stack-name "$VPC_STACK_NAME" &>/dev/null; then
+            print_warning "Stack $VPC_STACK_NAME already exists. Updating..."
+            
+            # Filter parameters for VPC template only
+            local vpc_params=$(mktemp)
+            jq '[.[] | select(.ParameterKey | IN("VpcCIDR", "PrivateSubnet1CIDR", "PrivateSubnet2CIDR", "PrivateSubnet3CIDR", "PublicSubnet1CIDR", "PublicSubnet2CIDR", "MWAAEnvironmentName"))]' deployment-config.json > "$vpc_params"
+            
+            aws cloudformation update-stack \
+                --stack-name "$VPC_STACK_NAME" \
+                --template-body file://01-vpc-mwaa.yml \
+                --parameters file://"$vpc_params" \
+                --capabilities CAPABILITY_NAMED_IAM 2>&1 | grep -v "No updates are to be performed" || true
+            
+            # Clean up temp file
+            rm -f "$vpc_params"
+            
+            # Only wait if update was actually performed
+            if aws cloudformation describe-stacks --stack-name "$VPC_STACK_NAME" --query 'Stacks[0].StackStatus' --output text 2>/dev/null | grep -q "UPDATE_IN_PROGRESS"; then
+                if ! wait_for_stack "$VPC_STACK_NAME" "create/update"; then
+                    print_error "VPC stack deployment failed"
+                    exit 1
+                fi
+            else
+                print_status "No updates needed for VPC stack"
+            fi
+        else
+            deploy_vpc_stack
+        fi
+        
+        # Setup Azure SSO after VPC deployment (Cognito is created in VPC stack)
+        if [[ "$RUN_AZURE_SSO" == true ]]; then
+            setup_azure_sso
+        fi
     else
         print_status "Skipping VPC deployment"
+        
+        # If Azure SSO flag is set but VPC deployment is skipped, still run Azure SSO
+        if [[ "$RUN_AZURE_SSO" == true ]] && [[ "$RUN_ALL" == false ]]; then
+            setup_azure_sso
+        fi
     fi
     
     # Upload files to S3
@@ -891,21 +1340,23 @@ main() {
         print_status "Skipping file upload"
     fi
     
-    # Build and deploy Lambda layer
+    # Deploy ALB stack
+    if [[ "$RUN_ALB" == true ]]; then
+        deploy_alb_stack
+    else
+        print_status "Skipping ALB deployment"
+    fi
+    
+    # Build and deploy Lambda layer (after ALB stack completion)
     if [[ "$RUN_LAMBDA_LAYER" == true ]]; then
         build_and_deploy_lambda_layer
     else
         print_status "Skipping Lambda layer build and deployment"
     fi
     
-    # Deploy ALB stack
+    # Update Lambda environment variables after Lambda layer deployment
     if [[ "$RUN_ALB" == true ]]; then
-        deploy_alb_stack
-        
-        # Update Lambda environment variables after ALB deployment
         update_lambda_environment
-    else
-        print_status "Skipping ALB deployment"
     fi
     
     # Update Lambda environment variables only
@@ -927,15 +1378,15 @@ main() {
         echo
         if [[ "$RUN_VPC" == true ]] && [[ "$RUN_UPLOAD" == false ]]; then
             print_warning "Next step: Run './deploy-stack.sh --upload' to upload files to S3"
-        elif [[ "$RUN_UPLOAD" == true ]] && [[ "$RUN_LAMBDA_LAYER" == false ]]; then
-            print_warning "Next step: Run './deploy-stack.sh --lambda-layer' to build and deploy Lambda layer"
-        elif [[ "$RUN_LAMBDA_LAYER" == true ]] && [[ "$RUN_ALB" == false ]]; then
+        elif [[ "$RUN_UPLOAD" == true ]] && [[ "$RUN_ALB" == false ]]; then
             print_warning "Next step: Run './deploy-stack.sh --alb' to deploy ALB stack"
+        elif [[ "$RUN_ALB" == true ]] && [[ "$RUN_LAMBDA_LAYER" == false ]]; then
+            print_warning "Next step: Run './deploy-stack.sh --lambda-layer' to build and deploy Lambda layer"
         elif [[ "$RUN_VPC" == true ]] && [[ "$RUN_ALB" == false ]]; then
             print_warning "Next steps:"
             echo "  1. Run './deploy-stack.sh --upload' to upload files to S3"
-            echo "  2. Run './deploy-stack.sh --lambda-layer' to build and deploy Lambda layer"
-            echo "  3. Run './deploy-stack.sh --alb' to deploy ALB stack"
+            echo "  2. Run './deploy-stack.sh --alb' to deploy ALB stack"
+            echo "  3. Run './deploy-stack.sh --lambda-layer' to build and deploy Lambda layer"
         fi
     fi
 }

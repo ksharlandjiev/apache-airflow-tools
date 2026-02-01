@@ -841,6 +841,7 @@ Resources:
       MinWorkers: 1
       Name: !Ref MWAAEnvironmentName
       AirflowConfigurationOptions:
+        core.dags_are_paused_at_creation: 'False'
         core.dag_run_conf_overrides_params: 'True'
         webserver.expose_config: 'True'
         fab.auth_backends: 'airflow.providers.fab.auth_manager.api.auth.backend.session,airflow.providers.fab.auth_manager.api.auth.backend.basic_auth'
