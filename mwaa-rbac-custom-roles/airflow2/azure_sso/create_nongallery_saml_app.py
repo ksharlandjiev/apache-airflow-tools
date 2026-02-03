@@ -7,13 +7,23 @@ This script replicates the exact Azure Portal workflow:
 2. Configure SAML SSO mode
 3. Set all SAML configuration (Entity ID, Reply URL, Sign-on URL, Group Claims)
 4. Provide Metadata URL for AWS Cognito
+5. Assign users (default) or groups (with --assign-groups flag)
 
 Usage:
+    # Assign users (default):
     python create_nongallery_saml_app.py \\
         --name "MWAA-Cognito-SAML" \\
         --entity-id "urn:amazon:cognito:sp:us-east-1_XXXXX" \\
         --reply-url "https://your-domain.auth.us-east-1.amazoncognito.com/saml2/idpresponse" \\
         --sign-on-url "https://your-alb.elb.amazonaws.com"
+
+    # Assign groups (requires Azure AD Premium):
+    python create_nongallery_saml_app.py \\
+        --name "MWAA-Cognito-SAML" \\
+        --entity-id "urn:amazon:cognito:sp:us-east-1_XXXXX" \\
+        --reply-url "https://your-domain.auth.us-east-1.amazoncognito.com/saml2/idpresponse" \\
+        --sign-on-url "https://your-alb.elb.amazonaws.com" \\
+        --assign-groups
 """
 
 import asyncio
@@ -24,7 +34,7 @@ from azure.identity.aio import DefaultAzureCredential
 import httpx
 
 
-async def create_nongallery_saml_app(app_name, entity_id, reply_url, sign_on_url, stack_name=None):
+async def create_nongallery_saml_app(app_name, entity_id, reply_url, sign_on_url, stack_name=None, assign_groups=False):
     """
     Create a non-gallery SAML Enterprise Application (Portal workflow).
 
@@ -36,6 +46,7 @@ async def create_nongallery_saml_app(app_name, entity_id, reply_url, sign_on_url
         reply_url: SAML Reply URL (Assertion Consumer Service URL)
         sign_on_url: SAML Sign-on URL
         stack_name: Optional stack name to append to app name for uniqueness
+        assign_groups: If True, assign groups starting with "airflow" instead of users
 
     Returns:
         dict: Application details
@@ -438,59 +449,117 @@ async def create_nongallery_saml_app(app_name, entity_id, reply_url, sign_on_url
 
             print(f"✓ Generated Federation Metadata URL\n")
 
-            # Step 8: Assign users with names starting with "mwaa" to the enterprise application
-            print("Assigning MWAA users to Enterprise Application...")
+            # Step 8: Assign users or groups to the enterprise application
+            if assign_groups:
+                print("Assigning groups with names starting with 'airflow' to Enterprise Application...")
 
-            try:
-                # Search for users with displayName or userPrincipalName starting with "mwaa"
-                users_response = await client.get(
-                    "https://graph.microsoft.com/v1.0/users?$filter=startswith(userPrincipalName,'mwaa') or startswith(displayName,'mwaa')",
-                    headers=headers,
-                    timeout=30.0
-                )
+                try:
+                    # Search for groups with displayName starting with "airflow"
+                    groups_response = await client.get(
+                        "https://graph.microsoft.com/v1.0/groups?$filter=startswith(displayName,'airflow')",
+                        headers=headers,
+                        timeout=30.0
+                    )
 
-                if users_response.status_code == 200:
-                    users_data = users_response.json()
-                    mwaa_users = users_data.get('value', [])
+                    if groups_response.status_code == 200:
+                        groups_data = groups_response.json()
+                        airflow_groups = groups_data.get('value', [])
 
-                    if mwaa_users:
-                        print(f"Found {len(mwaa_users)} MWAA user(s):")
-                        assigned_count = 0
+                        if airflow_groups:
+                            print(f"Found {len(airflow_groups)} Airflow group(s):")
+                            assigned_count = 0
 
-                        for user in mwaa_users:
-                            user_id = user['id']
-                            user_name = user.get('displayName', user.get('userPrincipalName', 'Unknown'))
+                            for group in airflow_groups:
+                                group_id = group['id']
+                                group_name = group.get('displayName', 'Unknown')
 
-                            # Assign user to the enterprise application
-                            assignment_payload = {
-                                "principalId": user_id,
-                                "resourceId": sp_id,
-                                "appRoleId": "00000000-0000-0000-0000-000000000000"  # Default access role
-                            }
+                                # Assign group to the enterprise application
+                                assignment_payload = {
+                                    "principalId": group_id,
+                                    "resourceId": sp_id,
+                                    "appRoleId": "00000000-0000-0000-0000-000000000000"  # Default access role
+                                }
 
-                            assign_response = await client.post(
-                                f"https://graph.microsoft.com/v1.0/servicePrincipals/{sp_id}/appRoleAssignedTo",
-                                json=assignment_payload,
-                                headers=headers,
-                                timeout=30.0
-                            )
+                                assign_response = await client.post(
+                                    f"https://graph.microsoft.com/v1.0/servicePrincipals/{sp_id}/appRoleAssignedTo",
+                                    json=assignment_payload,
+                                    headers=headers,
+                                    timeout=30.0
+                                )
 
-                            if assign_response.status_code == 201:
-                                print(f"  ✓ Assigned user: {user_name}")
-                                assigned_count += 1
-                            else:
-                                print(f"  ⚠ Could not assign user {user_name} (status {assign_response.status_code})")
+                                if assign_response.status_code == 201:
+                                    print(f"  ✓ Assigned group: {group_name}")
+                                    assigned_count += 1
+                                else:
+                                    print(f"  ⚠ Could not assign group {group_name} (status {assign_response.status_code})")
+                                    if assign_response.status_code == 400:
+                                        error_data = assign_response.json()
+                                        print(f"     Error details: {error_data.get('error', {}).get('message', 'Unknown error')}")
 
-                        print(f"\n✓ Successfully assigned {assigned_count} out of {len(mwaa_users)} MWAA user(s)\n")
+                            print(f"\n✓ Successfully assigned {assigned_count} out of {len(airflow_groups)} Airflow group(s)\n")
+                        else:
+                            print(f"No groups found with names starting with 'airflow'\n")
                     else:
-                        print(f"No users found with names starting with 'mwaa'\n")
-                else:
-                    print(f"⚠ Could not search for users (status {users_response.status_code})")
-                    print(f"  You'll need to assign users manually in Azure Portal\n")
+                        print(f"⚠ Could not search for groups (status {groups_response.status_code})")
+                        print(f"  You'll need to assign groups manually in Azure Portal\n")
 
-            except Exception as e:
-                print(f"⚠ Error assigning users: {e}")
-                print(f"  You can assign users manually in Azure Portal\n")
+                except Exception as e:
+                    print(f"⚠ Error assigning groups: {e}")
+                    print(f"  You can assign groups manually in Azure Portal\n")
+            else:
+                # Default behavior: Assign users with names starting with "mwaa"
+                print("Assigning MWAA users to Enterprise Application...")
+
+                try:
+                    # Search for users with displayName or userPrincipalName starting with "mwaa"
+                    users_response = await client.get(
+                        "https://graph.microsoft.com/v1.0/users?$filter=startswith(userPrincipalName,'mwaa') or startswith(displayName,'mwaa')",
+                        headers=headers,
+                        timeout=30.0
+                    )
+
+                    if users_response.status_code == 200:
+                        users_data = users_response.json()
+                        mwaa_users = users_data.get('value', [])
+
+                        if mwaa_users:
+                            print(f"Found {len(mwaa_users)} MWAA user(s):")
+                            assigned_count = 0
+
+                            for user in mwaa_users:
+                                user_id = user['id']
+                                user_name = user.get('displayName', user.get('userPrincipalName', 'Unknown'))
+
+                                # Assign user to the enterprise application
+                                assignment_payload = {
+                                    "principalId": user_id,
+                                    "resourceId": sp_id,
+                                    "appRoleId": "00000000-0000-0000-0000-000000000000"  # Default access role
+                                }
+
+                                assign_response = await client.post(
+                                    f"https://graph.microsoft.com/v1.0/servicePrincipals/{sp_id}/appRoleAssignedTo",
+                                    json=assignment_payload,
+                                    headers=headers,
+                                    timeout=30.0
+                                )
+
+                                if assign_response.status_code == 201:
+                                    print(f"  ✓ Assigned user: {user_name}")
+                                    assigned_count += 1
+                                else:
+                                    print(f"  ⚠ Could not assign user {user_name} (status {assign_response.status_code})")
+
+                            print(f"\n✓ Successfully assigned {assigned_count} out of {len(mwaa_users)} MWAA user(s)\n")
+                        else:
+                            print(f"No users found with names starting with 'mwaa'\n")
+                    else:
+                        print(f"⚠ Could not search for users (status {users_response.status_code})")
+                        print(f"  You'll need to assign users manually in Azure Portal\n")
+
+                except Exception as e:
+                    print(f"⚠ Error assigning users: {e}")
+                    print(f"  You can assign users manually in Azure Portal\n")
 
             # Success summary
             print("=" * 80)
@@ -584,10 +653,18 @@ async def create_nongallery_saml_app(app_name, entity_id, reply_url, sign_on_url
             print(f"     • email → http://schemas.xmlsoap.org/ws/2005/05/identity/claims/emailaddress")
             print(f"     • name → http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name")
             print(f"")
-            print(f"5. Review User Assignments:")
-            print(f"   - Go to Users and groups in Enterprise Application")
-            print(f"   - Verify MWAA users were assigned correctly")
-            print(f"   - Add additional users/groups if needed")
+            if assign_groups:
+                print(f"5. Review Group Assignments:")
+                print(f"   - Go to Users and groups in Enterprise Application")
+                print(f"   - Verify Airflow groups were assigned correctly")
+                print(f"   - Add additional groups/users if needed")
+                print(f"   - Note: Group assignment requires Azure AD Premium license")
+            else:
+                print(f"5. Review User Assignments:")
+                print(f"   - Go to Users and groups in Enterprise Application")
+                print(f"   - Verify MWAA users were assigned correctly")
+                print(f"   - Add additional users/groups if needed")
+                print(f"   - To assign groups, re-run with --assign-groups flag (requires Azure AD Premium)")
             print(f"")
             print(f"6. Test SSO:")
             print(f"   - Use the test feature in Azure Portal")
@@ -625,13 +702,23 @@ async def main():
         description="Create Non-Gallery SAML Enterprise Application",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Example:
+Examples:
+  # Assign users (default behavior):
   python create_nongallery_saml_app.py \\
     --name "MWAA-Cognito-SAML" \\
     --entity-id "urn:amazon:cognito:sp:us-east-1_UibBymSE1" \\
     --reply-url "https://domain.auth.us-east-1.amazoncognito.com/saml2/idpresponse" \\
     --sign-on-url "https://alb.elb.amazonaws.com" \\
     --stack-name "af3-1"
+
+  # Assign groups starting with "airflow" (requires Azure AD Premium):
+  python create_nongallery_saml_app.py \\
+    --name "MWAA-Cognito-SAML" \\
+    --entity-id "urn:amazon:cognito:sp:us-east-1_UibBymSE1" \\
+    --reply-url "https://domain.auth.us-east-1.amazoncognito.com/saml2/idpresponse" \\
+    --sign-on-url "https://alb.elb.amazonaws.com" \\
+    --stack-name "af3-1" \\
+    --assign-groups
         """
     )
 
@@ -664,7 +751,13 @@ Example:
         required=False,
         help="Stack name to append to application name for uniqueness (e.g., 'af3-1', 'dev', 'prod')"
     )
-    
+
+    parser.add_argument(
+        "--assign-groups",
+        action="store_true",
+        help="Assign groups starting with 'airflow' instead of users (requires Azure AD Premium)"
+    )
+
     parser.add_argument(
         "--json-output",
         action="store_true",
@@ -679,7 +772,8 @@ Example:
             entity_id=args.entity_id,
             reply_url=args.reply_url,
             sign_on_url=args.sign_on_url,
-            stack_name=args.stack_name
+            stack_name=args.stack_name,
+            assign_groups=args.assign_groups
         )
 
         if result:
