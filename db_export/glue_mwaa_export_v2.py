@@ -88,7 +88,6 @@ def create_glue_connection():
             'JDBC_CONNECTION_URL': jdbc_connection_url,
             'PASSWORD': password,
             'USERNAME': username,
-            'KAFKA_SSL_ENABLED': 'false'
         },
         'PhysicalConnectionRequirements': {
             'SubnetId': mwaa_subnet_id,

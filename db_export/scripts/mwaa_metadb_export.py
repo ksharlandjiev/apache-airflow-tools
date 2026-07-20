@@ -53,6 +53,27 @@ export_tables = json.loads(args['EXPORT_TABLES'])
 glue_connection_name = args['GLUE_CONNECTION_NAME']
 max_age_days = int(args['MAX_AGE_IN_DAYS'])
 
+# Retrieve connection properties from Glue for Spark JDBC reader
+# This approach bypasses Glue's connection property mangling that breaks SSL parameters
+glue_client = boto3.client('glue')
+_conn_response = glue_client.get_connection(Name=glue_connection_name, HidePassword=False)
+_conn_props = _conn_response['Connection']['ConnectionProperties']
+jdbc_url = _conn_props['JDBC_CONNECTION_URL']
+jdbc_username = _conn_props['USERNAME']
+jdbc_password = _conn_props['PASSWORD']
+
+# Enable SSL encryption via sslmode=require in the JDBC URL
+# This encrypts the connection without requiring certificate validation,
+# which is necessary because the MWAA metadata database uses an internal
+# certificate not present in standard trust stores.
+if '?' not in jdbc_url:
+    ssl_jdbc_url = jdbc_url + '?sslmode=require'
+else:
+    ssl_jdbc_url = jdbc_url + '&sslmode=require'
+
+print(f"JDBC URL (SSL enabled): {jdbc_url.split('@')[-1] if '@' in jdbc_url else jdbc_url}")
+print(f"SSL mode: require (driver-level encryption, no cert validation)")
+
 # Create date-organized path structure: exports/<env_name>/<year>/<month>/<day>/
 export_date = datetime.now()
 year = export_date.strftime('%Y')
@@ -120,14 +141,18 @@ def export_table_to_s3(table_name, date_field, s3_path):
         for table_variant in table_variations:
             try:
                 print(f"Trying to read table: {table_variant}")
-                df = glueContext.create_dynamic_frame.from_options(
-                    connection_type="postgresql",
-                    connection_options={
-                        "useConnectionProperties": "true",
-                        "connectionName": glue_connection_name,
-                        "dbtable": table_variant
-                    }
-                ).toDF()
+                # Use Spark JDBC reader directly instead of Glue's create_dynamic_frame
+                # to avoid Glue's connection property mangling that breaks SSL parameters.
+                # Glue appends ?OpenSourceSubProtocolOverride=true to JDBC URL params,
+                # corrupting sslmode and sslfactory values.
+                df = spark.read \
+                    .format("jdbc") \
+                    .option("url", ssl_jdbc_url) \
+                    .option("user", jdbc_username) \
+                    .option("password", jdbc_password) \
+                    .option("driver", "org.postgresql.Driver") \
+                    .option("dbtable", table_variant) \
+                    .load()
                 successful_table_name = table_variant
                 print(f"Successfully connected to table: {table_variant}")
                 break
@@ -254,22 +279,20 @@ def list_available_tables():
         print("Attempting to list available tables...")
         
         # Try to query information_schema to list tables
-        tables_query = """
-        (SELECT table_schema, table_name 
+        tables_query = """(SELECT table_schema, table_name 
          FROM information_schema.tables 
          WHERE table_type = 'BASE TABLE' 
          AND table_schema NOT IN ('information_schema', 'pg_catalog')
-         ORDER BY table_schema, table_name) AS available_tables
-        """
+         ORDER BY table_schema, table_name) AS available_tables"""
         
-        df = glueContext.create_dynamic_frame.from_options(
-            connection_type="postgresql",
-            connection_options={
-                "useConnectionProperties": "true",
-                "connectionName": glue_connection_name,
-                "dbtable": tables_query
-            }
-        ).toDF()
+        df = spark.read \
+            .format("jdbc") \
+            .option("url", ssl_jdbc_url) \
+            .option("user", jdbc_username) \
+            .option("password", jdbc_password) \
+            .option("driver", "org.postgresql.Driver") \
+            .option("dbtable", tables_query) \
+            .load()
         
         tables_list = df.collect()
         print(f"Found {len(tables_list)} tables:")
