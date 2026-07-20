@@ -5,29 +5,30 @@
 ## Environment Details
 
 ### MWAA Environment
-- **Environment Name**: `[e.g. production-airflow]`
-- **MWAA Version**: `[e.g., 2.8.1, 2.7.3, 2.9.0]`
-- **Environment Class**: `[Choose: mw1.small, mw1.medium, mw1.large, mw1.xlarge, mw1.2xlarge]`
-- **Region**: `[e.g., us-east-1, us-west-2, eu-west-1]`
+- **Environment Name**: `united-test-mwaa`
+- **MWAA Version**: `2.8.1`
+- **Environment Class**: `mw1.xlarge`
+- **Region**: `us-east-1`
 
 ### Current Configuration
-- **Min Workers**: `[e.g., 1, 2, 5]`
-- **Max Workers**: `[e.g., 10, 25, 50]`
-- **Scheduler Count**: `[e.g., 2, 4, 8]` (only for medium+ environments)
+- **Min Workers**: `1`
+- **Max Workers**: `10`
+- **Scheduler Count**: `4`
 
 ## Problem Overview
 
 ### When Did Issues Start
-`[e.g., 3 days ago, after last deployment, December 20th]`
+`10/03/2025`
+
 
 
 ### Symptoms Observed
 Check all that apply - **AI should look for additional issues beyond these**:
-- [ ] DAG import timeouts
+- [ X ] DAG import timeouts
 - [ ] Tasks stuck in queued state  
 - [ ] Worker crashes/restarts
-- [ ] Scheduler performance issues
-- [ ] Memory/CPU exhaustion
+- [ X ] Scheduler performance issues
+- [ X ] Memory/CPU exhaustion
 - [ ] Task execution failures
 - [ ] Zombie/orphaned tasks
 - [ ] Environment updates failing
@@ -146,4 +147,8 @@ impact before deploying to production.
 ---
 
 **Completed By**: `Kiro.dev - NextGen Agentic AI IDE`
+<<<<<<< HEAD
 **Date**: Add todays date.
+=======
+**Date**: Add todays date.
+>>>>>>> 66dfb15534afed0cd84ab091a25990dc7ada6184
