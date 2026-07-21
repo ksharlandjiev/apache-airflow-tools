@@ -299,17 +299,17 @@ cd ../..
 | **Dummy Operator** | `DummyOperator` | `EmptyOperator` (required) |
 | **PythonOperator Context** | `provide_context=True` | Always provided (parameter removed) |
 
-## Lambda Layer (psycopg2)
+## Lambda Layer (All Dependencies)
 
-The solution uses a Lambda layer for the psycopg2 PostgreSQL driver to enable direct database access.
+The solution uses a Lambda layer for all Python dependencies: psycopg2 (PostgreSQL driver), python-jose (JWT library), and requests (HTTP library).
 
 ### Why a Lambda Layer?
 
-psycopg2 requires compiled C extensions that must match the Lambda runtime environment (Amazon Linux 2). Building it in a Docker container ensures compatibility and resolves the common `No module named 'psycopg2._psycopg'` error.
+psycopg2 requires compiled C extensions that must match the Lambda runtime environment (Amazon Linux 2). Building it in a Docker container ensures compatibility and resolves the common `No module named 'psycopg2._psycopg'` error. By including all dependencies in the layer, the Lambda function code is minimal and deployment is faster.
 
 ### Dockerfile Configuration
 
-The Dockerfile includes system dependencies for proper compilation:
+The Dockerfile includes all Lambda dependencies:
 
 ```dockerfile
 FROM --platform=linux/amd64 public.ecr.aws/lambda/python:3.11
@@ -317,9 +317,9 @@ FROM --platform=linux/amd64 public.ecr.aws/lambda/python:3.11
 # Install system dependencies for psycopg2
 RUN yum install -y postgresql-devel gcc python3-devel
 
-# Install psycopg2-binary for x86_64
+# Install all Lambda dependencies: psycopg2-binary, python-jose, and requests
 RUN pip install --upgrade pip && \
-    pip install psycopg2-binary==2.9.9 -t /python --no-cache-dir
+    pip install psycopg2-binary==2.9.9 python-jose requests -t /python --no-cache-dir
 
 # Create the layer structure
 RUN mkdir -p /layer/python && cp -r /python/* /layer/python/
@@ -330,7 +330,7 @@ RUN mkdir -p /layer/python && cp -r /python/* /layer/python/
 The `deploy-stack.sh` script automatically:
 1. Checks for Docker availability
 2. Builds Docker image with Lambda runtime and system dependencies
-3. Installs psycopg2-binary with proper C extension compilation
+3. Installs all dependencies (psycopg2-binary, python-jose, requests) with proper C extension compilation
 4. Extracts layer and creates zip file
 5. Uploads to S3 bucket
 6. Publishes Lambda layer with version tracking
@@ -348,12 +348,20 @@ If you need to rebuild the layer manually:
 ```bash
 cd airflow2/lambda_auth  # or airflow3/lambda_auth
 
-# Build layer using Docker
+# Option 1: Build layer using Docker (recommended - includes all dependencies)
+# The Dockerfile installs: pip install psycopg2-binary==2.9.9 python-jose requests
 docker build --platform linux/amd64 -t psycopg2-layer .
 docker create --name psycopg2-container psycopg2-layer
 docker cp psycopg2-container:/layer/. ./lambda-layer/
 docker rm psycopg2-container
 docker rmi psycopg2-layer
+
+# Option 2: Manual build without Docker (if Docker is not available)
+# Create layer directory structure
+mkdir -p lambda-layer/python
+
+# Install all dependencies manually
+pip install psycopg2-binary==2.9.9 python-jose requests -t ./lambda-layer/python/
 
 # Create zip
 cd lambda-layer && zip -r ../psycopg2-layer.zip . -q && cd ..
@@ -364,7 +372,7 @@ aws s3 cp psycopg2-layer.zip s3://YOUR-BUCKET/lambda-layers/
 # Publish layer
 aws lambda publish-layer-version \
     --layer-name mwaa-psycopg2 \
-    --description 'PostgreSQL adapter for MWAA authorizer' \
+    --description 'All dependencies for MWAA authorizer (psycopg2, python-jose, requests)' \
     --content S3Bucket=YOUR-BUCKET,S3Key=lambda-layers/psycopg2-layer.zip \
     --compatible-runtimes python3.11 python3.12
 
@@ -374,14 +382,27 @@ aws lambda update-function-configuration \
     --layers arn:aws:lambda:REGION:ACCOUNT:layer:mwaa-psycopg2:VERSION
 ```
 
+**Note:** 
+- **Option 1 (Docker)** is recommended as it ensures psycopg2 is compiled for the correct Lambda runtime (Amazon Linux 2)
+- **Option 2 (Manual)** may work but psycopg2-binary might not be compatible with Lambda if built on a different platform
+- The layer must include all three dependencies: `psycopg2-binary`, `python-jose`, and `requests`
+- The Lambda function code contains only the application logic with no external dependencies
+
 ### Layer Structure
 
 ```
 psycopg2-layer.zip
 └── python/
-    └── psycopg2/
+    ├── psycopg2/
+    │   ├── __init__.py
+    │   ├── _psycopg.cpython-311-x86_64-linux-gnu.so  # C extension
+    │   └── ... (other files)
+    ├── jose/
+    │   ├── __init__.py
+    │   ├── jwt.py
+    │   └── ... (other files)
+    └── requests/
         ├── __init__.py
-        ├── _psycopg.cpython-311-x86_64-linux-gnu.so  # C extension
         └── ... (other files)
 ```
 
